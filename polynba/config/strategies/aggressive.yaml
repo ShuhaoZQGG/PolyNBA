@@ -1,0 +1,68 @@
+metadata:
+  name: "Aggressive Mean Reversion"
+  description: "Higher-risk strategy targeting larger edges with more capital"
+  risk_level: "high"
+  enabled: true
+
+factor_weights:
+  market_sentiment: 0.45
+  game_context: 0.35
+  team_strength: 0.20
+
+entry_rules:
+  conditions:
+    - name: "minimum_edge"
+      type: "threshold"
+      field: "edge_percentage"
+      operator: ">="
+      value: 5.0  # Lower edge threshold
+
+    - name: "minimum_confidence"
+      type: "threshold"
+      field: "confidence"
+      operator: ">="
+      value: 5  # Lower confidence threshold
+
+    - name: "time_remaining"
+      type: "threshold"
+      field: "total_seconds_remaining"
+      operator: ">="
+      value: 180  # 3 minutes
+
+    - name: "price_range_low"
+      type: "threshold"
+      field: "market_price"
+      operator: ">="
+      value: 0.10
+
+    - name: "price_range_high"
+      type: "threshold"
+      field: "market_price"
+      operator: "<="
+      value: 0.90
+
+exit_rules:
+  profit_targets:
+    - time_remaining_min: 720
+      target_percentage: 20.0
+    - time_remaining_min: 360
+      target_percentage: 12.0
+    - time_remaining_min: 0
+      target_percentage: 6.0
+
+  stop_loss:
+    value: 15.0  # Higher stop loss tolerance
+
+  time_stop:
+    exit_before_seconds: 30
+
+position_sizing:
+  method: "kelly_fraction"
+  kelly_multiplier: 0.40  # More aggressive sizing
+  max_position_usdc: 250
+  min_position_usdc: 25
+
+risk_limits:
+  max_concurrent_positions: 5
+  max_daily_loss_usdc: 300
+  max_position_per_game: 2

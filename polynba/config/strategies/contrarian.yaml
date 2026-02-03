@@ -1,0 +1,68 @@
+metadata:
+  name: "Contrarian Reversal"
+  description: "Targets extreme market overreactions for reversal opportunities"
+  risk_level: "medium"
+  enabled: true
+
+factor_weights:
+  market_sentiment: 0.50  # Heavy emphasis on market mispricing
+  game_context: 0.30
+  team_strength: 0.20
+
+entry_rules:
+  conditions:
+    - name: "large_mispricing"
+      type: "threshold"
+      field: "mispricing_magnitude"
+      operator: ">="
+      value: 10.0  # Large mispricing required
+
+    - name: "minimum_confidence"
+      type: "threshold"
+      field: "confidence"
+      operator: ">="
+      value: 6
+
+    - name: "time_remaining"
+      type: "threshold"
+      field: "total_seconds_remaining"
+      operator: ">="
+      value: 600  # 10 minutes for reversal
+
+    - name: "underdog_price"
+      type: "threshold"
+      field: "market_price"
+      operator: "<="
+      value: 0.40  # Focus on underdogs
+
+    - name: "not_blowout"
+      type: "threshold"
+      field: "score_differential_abs"
+      operator: "<="
+      value: 20  # Not a blowout
+
+exit_rules:
+  profit_targets:
+    - time_remaining_min: 720
+      target_percentage: 25.0  # Higher target for contrarian
+    - time_remaining_min: 360
+      target_percentage: 15.0
+    - time_remaining_min: 0
+      target_percentage: 8.0
+
+  stop_loss:
+    value: 12.0
+
+  time_stop:
+    exit_before_seconds: 120  # Exit earlier to avoid end-game volatility
+
+position_sizing:
+  method: "kelly_fraction"
+  kelly_multiplier: 0.30
+  max_position_usdc: 150
+  min_position_usdc: 15
+
+risk_limits:
+  max_concurrent_positions: 4
+  max_daily_loss_usdc: 200
+  max_position_per_game: 1

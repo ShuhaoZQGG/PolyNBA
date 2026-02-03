@@ -1,0 +1,44 @@
+# Risk Limits Configuration
+
+# Position limits
+position:
+  max_single_position_usdc: 100
+  max_total_exposure_usdc: 500
+  max_concurrent_positions: 5
+  max_positions_per_market: 2
+  max_positions_per_game: 1
+
+# Loss limits
+loss:
+  max_loss_per_trade_usdc: 25
+  max_daily_loss_usdc: 100
+  max_weekly_loss_usdc: 300
+  stop_loss_percent: 10.0
+
+# Profit taking
+profit:
+  take_profit_percent: 15.0
+  trailing_stop_percent: 5.0
+
+# Order limits
+order:
+  max_order_size_usdc: 50
+  min_order_size_usdc: 5
+  max_slippage_percent: 2.0
+
+# Time-based limits
+time:
+  min_time_remaining_seconds: 300
+  exit_before_end_seconds: 60
+  max_hold_time_minutes: 45
+
+# Gas limits (Polygon)
+gas:
+  max_gas_price_gwei: 500
+  max_gas_percent_of_trade: 5.0
+
+# Circuit breakers
+circuit_breaker:
+  consecutive_losses_trigger: 5
+  cooldown_minutes: 60
+  daily_loss_trigger_percent: 15.0

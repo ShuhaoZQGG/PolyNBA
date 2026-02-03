@@ -1,0 +1,32 @@
+# PolyNBA Dependencies
+
+# Core
+anthropic>=0.40.0
+python-dotenv>=1.0.0
+py-clob-client>=0.34.5
+web3>=6.0.0
+
+# Async HTTP
+aiohttp>=3.9.0
+aiolimiter>=1.1.0
+
+# Data handling
+pydantic>=2.5.0
+pyyaml>=6.0.0
+
+# Caching
+cachetools>=5.3.0
+
+# Retry logic
+tenacity>=8.2.0
+
+# WebSocket
+websocket-client>=1.0.0
+
+# Development
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.0.0
+black>=23.0.0
+ruff>=0.1.0
+mypy>=1.0.0

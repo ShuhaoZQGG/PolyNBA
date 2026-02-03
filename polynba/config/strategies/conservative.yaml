@@ -1,0 +1,72 @@
+metadata:
+  name: "Conservative Mean Reversion"
+  description: "Low-risk strategy focusing on high-confidence mean reversion opportunities"
+  risk_level: "low"
+  enabled: true
+
+factor_weights:
+  market_sentiment: 0.40
+  game_context: 0.35
+  team_strength: 0.25
+
+entry_rules:
+  conditions:
+    - name: "minimum_edge"
+      type: "threshold"
+      field: "edge_percentage"
+      operator: ">="
+      value: 8.0
+
+    - name: "minimum_confidence"
+      type: "threshold"
+      field: "confidence"
+      operator: ">="
+      value: 6
+
+    - name: "time_remaining"
+      type: "threshold"
+      field: "total_seconds_remaining"
+      operator: ">="
+      value: 300  # 5 minutes
+
+    - name: "price_range_low"
+      type: "threshold"
+      field: "market_price"
+      operator: ">="
+      value: 0.15
+
+    - name: "price_range_high"
+      type: "threshold"
+      field: "market_price"
+      operator: "<="
+      value: 0.85
+
+    - name: "no_risk_flags"
+      type: "list_empty"
+      field: "risk_flags"
+
+exit_rules:
+  profit_targets:
+    - time_remaining_min: 720   # >12 min: target 15%
+      target_percentage: 15.0
+    - time_remaining_min: 360   # 6-12 min: target 10%
+      target_percentage: 10.0
+    - time_remaining_min: 0     # <6 min: target 5%
+      target_percentage: 5.0
+
+  stop_loss:
+    value: 10.0
+
+  time_stop:
+    exit_before_seconds: 60  # Exit 1 minute before end
+
+position_sizing:
+  method: "kelly_fraction"
+  kelly_multiplier: 0.25  # Quarter Kelly
+  max_position_usdc: 100
+  min_position_usdc: 10
+
+risk_limits:
+  max_concurrent_positions: 3
+  max_daily_loss_usdc: 150
+  max_position_per_game: 1
