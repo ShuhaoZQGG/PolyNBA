@@ -296,6 +296,10 @@ class RuleEngine:
         position: Position,
         current_price: Decimal,
         time_remaining_seconds: int,
+        *,
+        stop_loss_pct_override: Optional[float] = None,
+        time_stop_seconds_override: Optional[int] = None,
+        profit_target_percent_override: Optional[float] = None,
     ) -> tuple[bool, str]:
         """Evaluate exit conditions for a position.
 
@@ -304,11 +308,23 @@ class RuleEngine:
             position: Current position
             current_price: Current market price
             time_remaining_seconds: Seconds remaining in game
+            stop_loss_pct_override: If set, use instead of strategy exit_rules.stop_loss_percent
+            time_stop_seconds_override: If set, use instead of strategy exit_rules.time_stop_seconds
 
         Returns:
             Tuple of (should_exit, reason)
         """
         exit_rules = strategy.exit_rules
+        stop_loss_pct = (
+            stop_loss_pct_override
+            if stop_loss_pct_override is not None
+            else exit_rules.stop_loss_percent
+        )
+        time_stop_seconds = (
+            time_stop_seconds_override
+            if time_stop_seconds_override is not None
+            else exit_rules.time_stop_seconds
+        )
 
         # Calculate P&L
         pnl_percent = position.unrealized_pnl_percent(current_price)
@@ -320,8 +336,21 @@ class RuleEngine:
             f"PnL={pnl_percent:+.1f}% | time_left={time_remaining_seconds}s"
         )
 
+        # Global profit target override (take profit at X%)
+        if profit_target_percent_override is not None:
+            if pnl_percent >= profit_target_percent_override:
+                logger.info(
+                    f"    -> Profit target (override): PnL {pnl_percent:.1f}% >= "
+                    f"{profit_target_percent_override:.1f}% -> SELL"
+                )
+                return True, f"Profit target hit ({pnl_percent:.1f}%)"
+            logger.info(
+                f"    -> Profit target (override): PnL {pnl_percent:.1f}% < "
+                f"{profit_target_percent_override:.1f}% -> no"
+            )
+
         # Check stop loss
-        stop_threshold = -exit_rules.stop_loss_percent
+        stop_threshold = -stop_loss_pct
         if pnl_percent <= stop_threshold:
             logger.info(
                 f"    -> Stop loss: PnL {pnl_percent:.1f}% <= {stop_threshold:.1f}% -> SELL"
@@ -354,13 +383,13 @@ class RuleEngine:
             )
 
         # Check time stop
-        if time_remaining_seconds <= exit_rules.time_stop_seconds:
+        if time_remaining_seconds <= time_stop_seconds:
             logger.info(
-                f"    -> Time stop: time_left {time_remaining_seconds}s <= {exit_rules.time_stop_seconds}s -> SELL"
+                f"    -> Time stop: time_left {time_remaining_seconds}s <= {time_stop_seconds}s -> SELL"
             )
             return True, "Time stop triggered"
         logger.info(
-            f"    -> Time stop: time_left {time_remaining_seconds}s > {exit_rules.time_stop_seconds}s -> no"
+            f"    -> Time stop: time_left {time_remaining_seconds}s > {time_stop_seconds}s -> no"
         )
 
         logger.info(f"    -> HOLD (no exit condition met)")
@@ -371,6 +400,8 @@ class RuleEngine:
         strategy: StrategyConfig,
         opportunity: EdgeOpportunity,
         bankroll: Decimal,
+        *,
+        kelly_multiplier_override: Optional[float] = None,
     ) -> Decimal:
         """Calculate position size based on strategy rules.
 
@@ -378,6 +409,7 @@ class RuleEngine:
             strategy: Strategy configuration
             opportunity: Edge opportunity
             bankroll: Available bankroll
+            kelly_multiplier_override: If set, scale strategy kelly_multiplier by this (e.g. 0.5 = half)
 
         Returns:
             Position size in USDC
@@ -387,7 +419,10 @@ class RuleEngine:
         if sizing.method == "kelly_fraction":
             # Kelly criterion
             kelly = opportunity.kelly_fraction
-            size = float(bankroll) * kelly * sizing.kelly_multiplier
+            mult = sizing.kelly_multiplier
+            if kelly_multiplier_override is not None:
+                mult = mult * kelly_multiplier_override
+            size = float(bankroll) * kelly * mult
         elif sizing.method == "fixed":
             size = sizing.fixed_size_usdc
         elif sizing.method == "percentage":

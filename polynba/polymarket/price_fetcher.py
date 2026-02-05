@@ -1,15 +1,106 @@
 """Price fetching from Polymarket CLOB API."""
 
 import logging
+import math
+import random
 from decimal import Decimal
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderBookSummary
 
 from .models import MarketPrices, PolymarketNBAMarket
 
+if TYPE_CHECKING:
+    from ..data.models import GameState
+
 logger = logging.getLogger(__name__)
+
+
+def home_win_probability_from_game_state(
+    game_state: "GameState",
+    noise_std: float = 0.015,
+) -> float:
+    """In-game home win probability from score and time (basketball-aware).
+
+    Uses score differential and time remaining: a 20-pt lead with 2 min left
+    is near-certain; the same lead with 20 min left is less so. Small noise
+    is added so prices are not perfectly mechanical.
+
+    Args:
+        game_state: Current game state (scores, period, clock).
+        noise_std: Std dev of Gaussian noise added to probability (e.g. 0.015).
+
+    Returns:
+        P(home wins) in [0, 1].
+    """
+    diff = game_state.score_differential  # positive = home leading
+    sec_left = max(1, game_state.total_seconds_remaining)
+    # Time factor: each point matters more as time runs out (e.g. 2 min left -> big impact)
+    minutes_left = sec_left / 60.0
+    time_factor = 10.0 / math.sqrt(minutes_left)
+    # Logistic: effective_diff in "points worth" -> home_prob
+    effective = diff * time_factor * 0.05
+    home_prob = 1.0 / (1.0 + math.exp(-effective))
+    home_prob += random.gauss(0, noise_std)
+    return max(0.02, min(0.98, home_prob))
+
+
+def generate_random_price_series(
+    n_ticks: int,
+    condition_id: str = "test_market",
+    spread: float = 0.02,
+    volatility: float = 0.03,
+    initial_home_mid: float = 0.5,
+    depth: float = 1000.0,
+    seed: Optional[int] = None,
+) -> list[MarketPrices]:
+    """Generate a random walk time series of MarketPrices for testing.
+
+    home_mid follows a bounded random walk; away_mid = 1 - home_mid.
+    Bid/ask are mid +/- spread/2. When series is exhausted, callers hold last value.
+
+    Args:
+        n_ticks: Number of price ticks to generate
+        condition_id: Market condition_id for each MarketPrices
+        spread: Bid-ask spread (e.g. 0.02 = 2 cents)
+        volatility: Std dev of random step for home_mid
+        initial_home_mid: Starting home mid price (0-1)
+        depth: Fixed depth for all sides
+        seed: Optional RNG seed for reproducibility
+
+    Returns:
+        List of MarketPrices of length n_ticks
+    """
+    if seed is not None:
+        random.seed(seed)
+    depth_d = Decimal(str(depth))
+    half = spread / 2
+    out: list[MarketPrices] = []
+    home_mid = max(0.2, min(0.8, initial_home_mid))
+    for _ in range(n_ticks):
+        home_mid = max(0.2, min(0.8, home_mid + random.gauss(0, volatility)))
+        away_mid = 1.0 - home_mid
+        home_bid = Decimal(str(round(home_mid - half, 4)))
+        home_ask = Decimal(str(round(home_mid + half, 4)))
+        away_bid = Decimal(str(round(away_mid - half, 4)))
+        away_ask = Decimal(str(round(away_mid + half, 4)))
+        out.append(
+            MarketPrices(
+                condition_id=condition_id,
+                home_mid_price=Decimal(str(round(home_mid, 4))),
+                away_mid_price=Decimal(str(round(away_mid, 4))),
+                home_best_bid=home_bid,
+                home_best_ask=home_ask,
+                away_best_bid=away_bid,
+                away_best_ask=away_ask,
+                home_bid_depth=depth_d,
+                home_ask_depth=depth_d,
+                away_bid_depth=depth_d,
+                away_ask_depth=depth_d,
+            )
+        )
+    return out
 
 # Default CLOB host
 DEFAULT_CLOB_HOST = "https://clob.polymarket.com"
@@ -54,11 +145,13 @@ class PriceFetcher:
     async def get_market_prices(
         self,
         market: PolymarketNBAMarket,
+        **kwargs: object,
     ) -> Optional[MarketPrices]:
         """Fetch current prices for a market.
 
         Args:
             market: The Polymarket NBA market to fetch prices for
+            **kwargs: Ignored (e.g. game_state for test-mode compatibility).
 
         Returns:
             MarketPrices or None if fetch fails
@@ -252,17 +345,196 @@ class PriceFetcher:
         return results
 
 
+class TimeSeriesPriceFetcher:
+    """Price fetcher that returns a pre-generated or scripted time series of prices.
+
+    Each call to get_market_prices returns the next tick. When the series is
+    exhausted, continues with a random walk from the last price so odds keep changing.
+    """
+
+    def __init__(
+        self,
+        prices: list[MarketPrices],
+        wrap: bool = False,
+        continue_random_walk: bool = True,
+        volatility: float = 0.03,
+        spread: float = 0.02,
+        *,
+        misprice_probability: float = 0.0,
+        misprice_min_pct: float = 5.0,
+        misprice_max_pct: float = 12.0,
+    ):
+        """Initialize with a list of MarketPrices (e.g. from generate_random_price_series).
+
+        Args:
+            prices: List of MarketPrices; each get_market_prices returns the next.
+            wrap: If True, after last tick wrap to first (ignored if continue_random_walk).
+            continue_random_walk: If True, after series exhausted generate new prices by random walk.
+            volatility: Std dev for random walk step when continue_random_walk is True.
+            spread: Bid-ask spread (e.g. 0.02) when generating from random walk.
+            misprice_probability: When using game_state prices, probability (0-1) of adding a
+                deliberate misprice so market diverges from model (e.g. 0.25 = 25% of ticks).
+            misprice_min_pct: Min absolute misprice in percent (e.g. 5 = 5%).
+            misprice_max_pct: Max absolute misprice in percent (e.g. 12 = 12%).
+        """
+        self._prices = prices
+        self._wrap = wrap
+        self._continue_random_walk = continue_random_walk
+        self._volatility = volatility
+        self._spread = spread
+        self._misprice_probability = misprice_probability
+        self._misprice_min_pct = misprice_min_pct
+        self._misprice_max_pct = misprice_max_pct
+        self._index = 0
+        self._last_market: Optional[PolymarketNBAMarket] = None
+        self._last_prices: Optional[MarketPrices] = None
+
+    def _prices_from_game_state(
+        self, market: PolymarketNBAMarket, game_state: "GameState"
+    ) -> MarketPrices:
+        """Build MarketPrices from game state (score + time -> win prob, then bid/ask)."""
+        home_prob = home_win_probability_from_game_state(game_state, noise_std=0.015)
+        # Optionally add a deliberate misprice so the "market" sometimes disagrees with the model
+        # (simulates overreaction / stale odds and produces edges >= min_edge in test mode).
+        if (
+            self._misprice_probability > 0
+            and random.random() < self._misprice_probability
+        ):
+            offset_pct = random.uniform(
+                self._misprice_min_pct / 100.0,
+                self._misprice_max_pct / 100.0,
+            )
+            home_prob += random.choice([-1.0, 1.0]) * offset_pct
+            home_prob = max(0.02, min(0.98, home_prob))
+        away_prob = 1.0 - home_prob
+        half = self._spread / 2
+        depth = (
+            self._prices[0].home_bid_depth
+            if self._prices
+            else Decimal("1000")
+        )
+        prices = MarketPrices(
+            condition_id=market.condition_id,
+            home_mid_price=Decimal(str(round(home_prob, 4))),
+            away_mid_price=Decimal(str(round(away_prob, 4))),
+            home_best_bid=Decimal(str(round(home_prob - half, 4))),
+            home_best_ask=Decimal(str(round(home_prob + half, 4))),
+            away_best_bid=Decimal(str(round(away_prob - half, 4))),
+            away_best_ask=Decimal(str(round(away_prob + half, 4))),
+            home_bid_depth=depth,
+            home_ask_depth=depth,
+            away_bid_depth=depth,
+            away_ask_depth=depth,
+        )
+        self._last_market = market
+        self._last_prices = prices
+        return prices
+
+    def _next_from_random_walk(self, market: PolymarketNBAMarket) -> Optional[MarketPrices]:
+        """Generate next MarketPrices from last price using a random step."""
+        if self._last_prices is None:
+            return None
+        half = self._spread / 2
+        home_mid = float(self._last_prices.home_mid_price) + random.gauss(0, self._volatility)
+        home_mid = max(0.2, min(0.8, home_mid))
+        away_mid = 1.0 - home_mid
+        depth = self._last_prices.home_bid_depth
+        prices = MarketPrices(
+            condition_id=market.condition_id,
+            home_mid_price=Decimal(str(round(home_mid, 4))),
+            away_mid_price=Decimal(str(round(away_mid, 4))),
+            home_best_bid=Decimal(str(round(home_mid - half, 4))),
+            home_best_ask=Decimal(str(round(home_mid + half, 4))),
+            away_best_bid=Decimal(str(round(away_mid - half, 4))),
+            away_best_ask=Decimal(str(round(away_mid + half, 4))),
+            home_bid_depth=depth,
+            home_ask_depth=depth,
+            away_bid_depth=depth,
+            away_ask_depth=depth,
+        )
+        self._last_market = market
+        self._last_prices = prices
+        return prices
+
+    async def get_market_prices(
+        self,
+        market: PolymarketNBAMarket,
+        *,
+        game_state: Optional["GameState"] = None,
+    ) -> Optional[MarketPrices]:
+        """Return prices. If game_state given, use score+time win prob; else series/random walk."""
+        if game_state is not None:
+            return self._prices_from_game_state(market, game_state)
+        if not self._prices:
+            return None
+        if self._index >= len(self._prices):
+            if self._continue_random_walk and self._last_prices is not None:
+                return self._next_from_random_walk(market)
+            if self._wrap:
+                self._index = 0
+            else:
+                idx = len(self._prices) - 1
+                tick = self._prices[idx]
+                prices = MarketPrices(
+                    condition_id=market.condition_id,
+                    home_mid_price=tick.home_mid_price,
+                    away_mid_price=tick.away_mid_price,
+                    home_best_bid=tick.home_best_bid,
+                    home_best_ask=tick.home_best_ask,
+                    away_best_bid=tick.away_best_bid,
+                    away_best_ask=tick.away_best_ask,
+                    home_bid_depth=tick.home_bid_depth,
+                    home_ask_depth=tick.home_ask_depth,
+                    away_bid_depth=tick.away_bid_depth,
+                    away_ask_depth=tick.away_ask_depth,
+                )
+                self._last_market = market
+                self._last_prices = prices
+                return prices
+        idx = self._index
+        tick = self._prices[idx]
+        self._index += 1
+        prices = MarketPrices(
+            condition_id=market.condition_id,
+            home_mid_price=tick.home_mid_price,
+            away_mid_price=tick.away_mid_price,
+            home_best_bid=tick.home_best_bid,
+            home_best_ask=tick.home_best_ask,
+            away_best_bid=tick.away_best_bid,
+            away_best_ask=tick.away_best_ask,
+            home_bid_depth=tick.home_bid_depth,
+            home_ask_depth=tick.home_ask_depth,
+            away_bid_depth=tick.away_bid_depth,
+            away_ask_depth=tick.away_ask_depth,
+        )
+        self._last_market = market
+        self._last_prices = prices
+        return prices
+
+    def get_token_sell_price(self, token_id: str) -> Optional[Decimal]:
+        """Return current best bid for the token (from last get_market_prices result)."""
+        if self._last_market is None or self._last_prices is None:
+            return None
+        if token_id == self._last_market.home_token_id:
+            return self._last_prices.home_best_bid
+        if token_id == self._last_market.away_token_id:
+            return self._last_prices.away_best_bid
+        return None
+
+
 class SimulatedPriceFetcher:
     """Simulated price fetcher for testing and fallback."""
 
     async def get_market_prices(
         self,
         market: PolymarketNBAMarket,
+        **kwargs: object,
     ) -> MarketPrices:
         """Return simulated prices for testing.
 
         Args:
             market: Market to generate prices for
+            **kwargs: Ignored (e.g. game_state for test-mode compatibility).
 
         Returns:
             Simulated MarketPrices

@@ -33,12 +33,18 @@ class EfficiencyComparison:
 
 @dataclass
 class StrengthTierComparison:
-    """Comparison of team strength tiers."""
+    """Comparison of team strength tiers.
+
+    Tiers (by net_rating): elite > 5, contender > 2, average > -2,
+    below_average > -5, else rebuilding.
+    mismatch_level: number of tier steps between teams (0 = same tier,
+    1 = adjacent, 2 = two apart, etc.), from abs(home_tier_idx - away_tier_idx).
+    """
 
     home_tier: str
     away_tier: str
     tier_advantage: str  # "home", "away", or "even"
-    mismatch_level: int  # 0-3 tiers difference
+    mismatch_level: int  # 0-4: number of tier steps between teams
 
 
 @dataclass

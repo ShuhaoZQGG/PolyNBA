@@ -47,20 +47,47 @@ apis:
       fallback_to_simulated: true  # Use simulated prices if no real market found
       min_liquidity_usdc: 100  # Minimum liquidity to consider market tradeable
 
-# Risk management
+# Edge detection (buy filters)
+edge:
+  min_edge_percent: 5.0
+  max_edge_percent: 50.0
+  min_confidence: 5
+  min_market_price: 0.10
+  max_market_price: 0.90
+  min_time_remaining_seconds: 300
+  exclude_overtime: false
+
+# Exit overrides (sell; null = use strategy YAML)
+exit:
+  stop_loss_percent: null
+  exit_before_seconds: null
+  profit_target_percent: null  # e.g. 15.0 = take profit at 15% (overrides strategy buckets)
+
+# Risk limits (wired to RiskManager)
 risk:
   max_position_usdc: 100
   max_total_exposure_usdc: 500
   max_daily_loss_usdc: 100
   max_concurrent_positions: 5
-  stop_loss_percent: 10.0
+  max_position_per_market: 2
+  min_order_size_usdc: 5
+  max_order_size_usdc: 50
+  min_position_usdc: null   # Global min; skip signal if size below (null = use strategy)
 
-# Portfolio allocation by risk level
+# Bettable % of balance: max fraction of bankroll that can be in positions
 allocation:
+  max_portfolio_exposure: 0.50   # Max 50% of balance bettable
   low_risk_percent: 0.50
   medium_risk_percent: 0.35
   high_risk_percent: 0.15
-  max_portfolio_exposure: 0.50
+
+# Strategy / conflict resolution
+trading:
+  conflict_min_confidence: 7   # Take conflicting side only if confidence >= this
+
+# Position sizing overrides (null = use strategy YAML)
+position_sizing:
+  kelly_multiplier_override: null   # e.g. 0.5 = half Kelly; null = use strategy
 
 # Logging
 logging:

@@ -8,7 +8,12 @@ from .models import (
     MarketPrices,
     PolymarketNBAMarket,
 )
-from .price_fetcher import PriceFetcher, SimulatedPriceFetcher
+from .price_fetcher import (
+    PriceFetcher,
+    SimulatedPriceFetcher,
+    TimeSeriesPriceFetcher,
+    generate_random_price_series,
+)
 
 __all__ = [
     # Discovery
@@ -24,4 +29,6 @@ __all__ = [
     # Price Fetching
     "PriceFetcher",
     "SimulatedPriceFetcher",
+    "TimeSeriesPriceFetcher",
+    "generate_random_price_series",
 ]

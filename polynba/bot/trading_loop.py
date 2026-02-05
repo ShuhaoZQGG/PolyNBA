@@ -5,10 +5,10 @@ import logging
 import math
 import os
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import yaml
 
@@ -20,8 +20,16 @@ from ..analysis import (
     ProbabilityCalculator,
 )
 from ..data import DataManager, GameState, TeamStats
-from ..polymarket import MarketDiscovery, MarketMapper, PriceFetcher
-from ..strategy import StrategyManager, TradingSignal
+from ..polymarket import (
+    MarketDiscovery,
+    MarketMapper,
+    PriceFetcher,
+    TimeSeriesPriceFetcher,
+    generate_random_price_series,
+)
+from ..testing import TestDataManager, TestMarketMapper
+from ..testing.mock_mapper import TEST_CONDITION_ID
+from ..strategy import CapitalAllocation, StrategyManager, TradingSignal
 from ..trading import (
     MarketData,
     OrderManager,
@@ -36,6 +44,20 @@ from ..utils.performance import PerformanceTracker
 from ..utils.portfolio_display import PortfolioDisplay
 
 logger = logging.getLogger(__name__)
+
+
+def _optional_float(v: Any) -> Optional[float]:
+    """Return float or None if v is None."""
+    if v is None:
+        return None
+    return float(v)
+
+
+def _optional_int(v: Any) -> Optional[int]:
+    """Return int or None if v is None."""
+    if v is None:
+        return None
+    return int(v)
 
 
 @dataclass
@@ -63,11 +85,50 @@ class BotConfig:
     allowed_game_ids: Optional[List[str]] = None
     instance_id: Optional[int] = None
 
+    # Test game (mock time-series prices, no real API)
+    test_game: bool = False
+    test_game_ticks: Optional[int] = None  # Number of price ticks / game states (default 20)
+
     # Polymarket settings
     polymarket_gamma_api: str = "https://gamma-api.polymarket.com"
     polymarket_clob_host: str = "https://clob.polymarket.com"
     polymarket_discovery_cache_ttl: int = 300
     polymarket_fallback_to_simulated: bool = True
+
+    # Edge detection (buy filters)
+    min_edge_percent: float = 5.0
+    max_edge_percent: float = 50.0
+    min_confidence: int = 5
+    min_market_price: float = 0.10
+    max_market_price: float = 0.90
+    min_time_remaining_seconds: int = 300
+    exclude_overtime: bool = False
+
+    # Exit overrides (sell; None = use strategy YAML)
+    exit_stop_loss_percent: Optional[float] = None
+    exit_before_seconds: Optional[int] = None
+    exit_profit_target_percent: Optional[float] = None  # Global take-profit % override
+
+    # Risk limits (wired to RiskManager)
+    max_position_usdc: float = 100.0
+    max_total_exposure_usdc: float = 500.0
+    max_daily_loss_usdc: float = 100.0
+    max_concurrent_positions: int = 5
+    max_position_per_market: int = 2
+    min_order_size_usdc: float = 5.0
+    max_order_size_usdc: float = 50.0
+    min_position_usdc: Optional[float] = None  # Global min; skip signal if size below (None = use strategy)
+
+    # Allocation: % of balance bettable and split by risk level
+    max_portfolio_exposure: float = 0.50  # Max fraction of bankroll in positions (bettable %)
+    allocation_low_risk_percent: float = 0.50
+    allocation_medium_risk_percent: float = 0.35
+    allocation_high_risk_percent: float = 0.15
+
+    # Strategy / conflict
+    conflict_min_confidence: int = 7  # Take conflicting side only if confidence >= this
+    kelly_multiplier_override: Optional[float] = None  # Scale strategy Kelly (e.g. 0.5 = half); None = use strategy
+    min_edge_strategy_overrides: Dict[str, float] = field(default_factory=dict)  # Per-strategy min edge % (e.g. {"conservative": 3.0, "aggressive": 5.0})
 
     @classmethod
     def from_yaml(cls, path: Path) -> "BotConfig":
@@ -100,6 +161,8 @@ class BotConfig:
             command_server_port=command_config.get("port", 8765),
             allowed_game_ids=run_config.get("allowed_game_ids"),
             instance_id=run_config.get("instance_id"),
+            test_game=run_config.get("test_game", False),
+            test_game_ticks=run_config.get("test_game_ticks"),
             # Polymarket settings
             polymarket_gamma_api=polymarket_config.get(
                 "gamma_api", "https://gamma-api.polymarket.com"
@@ -109,6 +172,39 @@ class BotConfig:
             ),
             polymarket_discovery_cache_ttl=discovery_config.get("cache_ttl_seconds", 300),
             polymarket_fallback_to_simulated=prices_config.get("fallback_to_simulated", True),
+            # Edge detection
+            min_edge_percent=data.get("edge", {}).get("min_edge_percent", 5.0),
+            max_edge_percent=data.get("edge", {}).get("max_edge_percent", 50.0),
+            min_confidence=data.get("edge", {}).get("min_confidence", 5),
+            min_market_price=float(data.get("edge", {}).get("min_market_price", 0.10)),
+            max_market_price=float(data.get("edge", {}).get("max_market_price", 0.90)),
+            min_time_remaining_seconds=int(data.get("edge", {}).get("min_time_remaining_seconds", 300)),
+            exclude_overtime=bool(data.get("edge", {}).get("exclude_overtime", False)),
+            # Exit overrides (None = use strategy)
+            exit_stop_loss_percent=_optional_float(data.get("exit", {}).get("stop_loss_percent")),
+            exit_before_seconds=_optional_int(data.get("exit", {}).get("exit_before_seconds")),
+            exit_profit_target_percent=_optional_float(data.get("exit", {}).get("profit_target_percent")),
+            # Risk limits
+            max_position_usdc=float(data.get("risk", {}).get("max_position_usdc", 100)),
+            max_total_exposure_usdc=float(data.get("risk", {}).get("max_total_exposure_usdc", 500)),
+            max_daily_loss_usdc=float(data.get("risk", {}).get("max_daily_loss_usdc", 100)),
+            max_concurrent_positions=int(data.get("risk", {}).get("max_concurrent_positions", 5)),
+            max_position_per_market=int(data.get("risk", {}).get("max_position_per_market", 2)),
+            min_order_size_usdc=float(data.get("risk", {}).get("min_order_size_usdc", 5)),
+            max_order_size_usdc=float(data.get("risk", {}).get("max_order_size_usdc", 50)),
+            min_position_usdc=_optional_float(data.get("risk", {}).get("min_position_usdc")),
+            # Allocation (bettable % of balance)
+            max_portfolio_exposure=float(data.get("allocation", {}).get("max_portfolio_exposure", 0.50)),
+            allocation_low_risk_percent=float(data.get("allocation", {}).get("low_risk_percent", 0.50)),
+            allocation_medium_risk_percent=float(data.get("allocation", {}).get("medium_risk_percent", 0.35)),
+            allocation_high_risk_percent=float(data.get("allocation", {}).get("high_risk_percent", 0.15)),
+            # Strategy / conflict
+            conflict_min_confidence=int(data.get("trading", {}).get("conflict_min_confidence", 7)),
+            kelly_multiplier_override=_optional_float(data.get("position_sizing", {}).get("kelly_multiplier_override")),
+            min_edge_strategy_overrides={
+                str(k): float(v)
+                for k, v in (data.get("edge", {}).get("min_edge_strategy_overrides") or {}).items()
+            },
         )
 
 
@@ -131,8 +227,26 @@ class TradingBot:
         self._config = config
         self._running = False
 
-        # Core components
-        self._data_manager = data_manager or DataManager()
+        # Core components (or test-game mocks)
+        if config.test_game:
+            n_ticks = config.test_game_ticks or 20
+            self._data_manager = TestDataManager(n_game_states=n_ticks)
+            self._market_mapper = TestMarketMapper()
+            self._price_fetcher = TimeSeriesPriceFetcher(
+                prices=generate_random_price_series(
+                    n_ticks, condition_id=TEST_CONDITION_ID
+                ),
+                misprice_probability=0.15,
+                misprice_min_pct=5.0,
+                misprice_max_pct=12.0,
+            )
+            self._fallback_to_simulated = False
+            logger.info("Test game mode: using mock game and time-series prices")
+        else:
+            self._data_manager = data_manager or DataManager()
+            self._market_mapper = None
+            self._price_fetcher = None
+            self._fallback_to_simulated = config.polymarket_fallback_to_simulated
 
         if executor:
             self._executor = executor
@@ -159,8 +273,18 @@ class TradingBot:
 
         # Trading components
         self._position_tracker = PositionTracker()
+        risk_limits = RiskLimits(
+            max_position_size_usdc=Decimal(str(config.max_position_usdc)),
+            max_total_exposure_usdc=Decimal(str(config.max_total_exposure_usdc)),
+            max_concurrent_positions=config.max_concurrent_positions,
+            max_position_per_market=config.max_position_per_market,
+            max_daily_loss_usdc=Decimal(str(config.max_daily_loss_usdc)),
+            max_order_size_usdc=Decimal(str(config.max_order_size_usdc)),
+            min_order_size_usdc=Decimal(str(config.min_order_size_usdc)),
+        )
         self._risk_manager = RiskManager(
-            position_tracker=self._position_tracker
+            limits=risk_limits,
+            position_tracker=self._position_tracker,
         )
         self._order_manager = OrderManager(
             executor=self._executor,
@@ -168,15 +292,39 @@ class TradingBot:
             on_cancel=self._on_order_cancel,
         )
 
-        # Strategy components
+        # Strategy components (allocation = bettable % of balance by risk level)
+        allocation = CapitalAllocation(
+            low_risk_percent=config.allocation_low_risk_percent,
+            medium_risk_percent=config.allocation_medium_risk_percent,
+            high_risk_percent=config.allocation_high_risk_percent,
+        )
         self._strategy_manager = StrategyManager(
             position_tracker=self._position_tracker,
             total_bankroll=Decimal(str(config.bankroll)),
+            max_portfolio_exposure=config.max_portfolio_exposure,
+            allocation=allocation,
+            exit_stop_loss_pct_override=config.exit_stop_loss_percent,
+            exit_time_stop_seconds_override=config.exit_before_seconds,
+            exit_profit_target_percent_override=config.exit_profit_target_percent,
+            conflict_min_confidence=config.conflict_min_confidence,
+            kelly_multiplier_override=config.kelly_multiplier_override,
+            min_position_usdc_override=config.min_position_usdc,
+            min_edge_strategy_overrides=config.min_edge_strategy_overrides,
         )
 
         # Analysis components
         self._probability_calculator = ProbabilityCalculator()
-        self._edge_detector = EdgeDetector()
+        self._edge_detector = EdgeDetector(
+            filter_config=EdgeFilter(
+                min_edge_percent=config.min_edge_percent,
+                max_edge_percent=config.max_edge_percent,
+                min_confidence=config.min_confidence,
+                min_market_price=Decimal(str(config.min_market_price)),
+                max_market_price=Decimal(str(config.max_market_price)),
+                min_time_remaining_seconds=config.min_time_remaining_seconds,
+                exclude_overtime=config.exclude_overtime,
+            )
+        )
         self._context_builder = ContextBuilder()
         self._claude_analyzer = ClaudeAnalyzer() if config.claude_enabled else None
 
@@ -191,19 +339,20 @@ class TradingBot:
             initial_balance=config.bankroll
         )
 
-        # Polymarket integration for real market data
+        # Polymarket integration for real market data (or test mocks already set)
         self._market_discovery = MarketDiscovery(
             gamma_api_url=config.polymarket_gamma_api,
             cache_ttl_seconds=config.polymarket_discovery_cache_ttl,
         )
-        self._market_mapper = MarketMapper(
-            discovery=self._market_discovery,
-            mapping_ttl_seconds=config.polymarket_discovery_cache_ttl,
-        )
-        self._price_fetcher = PriceFetcher(
-            clob_host=config.polymarket_clob_host,
-        )
-        self._fallback_to_simulated = config.polymarket_fallback_to_simulated
+        if not config.test_game:
+            self._market_mapper = MarketMapper(
+                discovery=self._market_discovery,
+                mapping_ttl_seconds=config.polymarket_discovery_cache_ttl,
+            )
+            self._price_fetcher = PriceFetcher(
+                clob_host=config.polymarket_clob_host,
+            )
+            self._fallback_to_simulated = config.polymarket_fallback_to_simulated
 
         # State
         self._iteration = 0
@@ -244,6 +393,9 @@ class TradingBot:
         This runs at startup to confirm we can fetch market data
         and to show what NBA markets are currently available.
         """
+        if self._config.test_game:
+            logger.info("Test game mode: skipping Polymarket API verification")
+            return
         logger.info("")
         logger.info("Verifying Polymarket API connection...")
 
@@ -493,11 +645,19 @@ class TradingBot:
             estimate=estimate,
         )
 
-        min_edge = self._edge_detector.filter_config.min_edge_percent
+        filt = self._edge_detector.filter_config
         if not opportunities:
-            logger.info(
-                f"  No edge opportunity (need >= {min_edge}% edge)"
-            )
+            if game_state.total_seconds_remaining < filt.min_time_remaining_seconds:
+                logger.info(
+                    f"  Filtered: not enough time remaining "
+                    f"({game_state.total_seconds_remaining}s < {filt.min_time_remaining_seconds}s)"
+                )
+            elif filt.exclude_overtime and game_state.period.is_overtime:
+                logger.info("  Filtered: overtime excluded")
+            else:
+                logger.info(
+                    f"  No edge opportunity (need >= {filt.min_edge_percent}% edge)"
+                )
         else:
             for opportunity in opportunities:
                 logger.info(
@@ -546,9 +706,10 @@ class TradingBot:
             mapping = await self._market_mapper.get_market_for_game(game_state)
 
             if mapping is not None:
-                # Fetch real prices
+                # Fetch real prices (test game: prices from game state; live: from API)
                 prices = await self._price_fetcher.get_market_prices(
-                    mapping.polymarket_market
+                    mapping.polymarket_market,
+                    game_state=game_state if self._config.test_game else None,
                 )
 
                 if prices is not None:

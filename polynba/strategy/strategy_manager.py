@@ -3,7 +3,7 @@
 import logging
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Optional
+from typing import Dict, Optional
 
 from ..analysis.edge_detector import EdgeOpportunity
 from ..analysis.probability_calculator import FactorWeights, ProbabilityCalculator
@@ -78,7 +78,15 @@ class StrategyManager:
         position_tracker: Optional[PositionTracker] = None,
         allocation: Optional[CapitalAllocation] = None,
         total_bankroll: Decimal = Decimal("1000"),
-        max_portfolio_exposure: float = 0.50,  # Max 50% deployed
+        max_portfolio_exposure: float = 0.50,  # Max fraction of bankroll bettable
+        *,
+        exit_stop_loss_pct_override: Optional[float] = None,
+        exit_time_stop_seconds_override: Optional[int] = None,
+        exit_profit_target_percent_override: Optional[float] = None,
+        conflict_min_confidence: int = 7,
+        kelly_multiplier_override: Optional[float] = None,
+        min_position_usdc_override: Optional[float] = None,
+        min_edge_strategy_overrides: Optional[Dict[str, float]] = None,
     ):
         """Initialize strategy manager.
 
@@ -86,9 +94,16 @@ class StrategyManager:
             loader: Strategy loader instance
             rule_engine: Rule engine instance
             position_tracker: Position tracker instance
-            allocation: Capital allocation configuration
+            allocation: Capital allocation configuration (low/medium/high risk %)
             total_bankroll: Total available bankroll
-            max_portfolio_exposure: Maximum portfolio exposure
+            max_portfolio_exposure: Max fraction of bankroll in positions (bettable %)
+            exit_stop_loss_pct_override: If set, override strategy stop-loss %% for exit
+            exit_time_stop_seconds_override: If set, override strategy time stop
+            exit_profit_target_percent_override: If set, take profit at this %% (overrides strategy)
+            conflict_min_confidence: Take conflicting side only if confidence >= this
+            kelly_multiplier_override: If set, scale strategy Kelly by this (e.g. 0.5 = half)
+            min_position_usdc_override: If set, skip signal if size below this
+            min_edge_strategy_overrides: Per-strategy min edge %% (e.g. {"conservative": 3.0, "aggressive": 5.0})
         """
         self._loader = loader or StrategyLoader()
         self._rule_engine = rule_engine or RuleEngine()
@@ -96,6 +111,13 @@ class StrategyManager:
         self._allocation = allocation or CapitalAllocation()
         self._total_bankroll = total_bankroll
         self._max_exposure = max_portfolio_exposure
+        self._exit_stop_loss_pct_override = exit_stop_loss_pct_override
+        self._exit_time_stop_seconds_override = exit_time_stop_seconds_override
+        self._exit_profit_target_percent_override = exit_profit_target_percent_override
+        self._conflict_min_confidence = conflict_min_confidence
+        self._kelly_multiplier_override = kelly_multiplier_override
+        self._min_position_usdc_override = min_position_usdc_override
+        self._min_edge_strategy_overrides = min_edge_strategy_overrides or {}
 
         # Load strategies
         self._strategies: dict[str, StrategyConfig] = {}
@@ -134,6 +156,18 @@ class StrategyManager:
                 "losses": 0,
                 "total_pnl": Decimal("0"),
             }
+
+        for strategy_id, min_edge in self._min_edge_strategy_overrides.items():
+            strategy = self._strategies.get(strategy_id)
+            if strategy is None:
+                continue
+            for cond in strategy.entry_rules.conditions:
+                if cond.name == "minimum_edge" and cond.field == "edge_percentage":
+                    cond.value = min_edge
+                    logger.info(
+                        f"Strategy '{strategy_id}' minimum_edge overridden to {min_edge}%"
+                    )
+                    break
 
         logger.info(f"Loaded {len(self._strategies)} strategies: {self._active_strategy_ids}")
 
@@ -178,10 +212,16 @@ class StrategyManager:
                 # Calculate position size
                 available_capital = self._get_available_capital(strategy)
                 size = self._rule_engine.calculate_position_size(
-                    strategy, opportunity, available_capital
+                    strategy,
+                    opportunity,
+                    available_capital,
+                    kelly_multiplier_override=self._kelly_multiplier_override,
                 )
 
-                if size < Decimal(str(strategy.position_sizing.min_position_usdc)):
+                min_size = strategy.position_sizing.min_position_usdc
+                if self._min_position_usdc_override is not None:
+                    min_size = max(min_size, self._min_position_usdc_override)
+                if size < Decimal(str(min_size)):
                     logger.debug(
                         f"Strategy {strategy_id}: Size too small ({size})"
                     )
@@ -253,6 +293,9 @@ class StrategyManager:
                 position,
                 current_price,
                 game_state.total_seconds_remaining,
+                stop_loss_pct_override=self._exit_stop_loss_pct_override,
+                time_stop_seconds_override=self._exit_time_stop_seconds_override,
+                profit_target_percent_override=self._exit_profit_target_percent_override,
             )
 
             if should_exit:
@@ -299,6 +342,9 @@ class StrategyManager:
             position,
             current_price,
             game_state.total_seconds_remaining,
+            stop_loss_pct_override=self._exit_stop_loss_pct_override,
+            time_stop_seconds_override=self._exit_time_stop_seconds_override,
+            profit_target_percent_override=self._exit_profit_target_percent_override,
         )
         if not should_exit:
             return None
@@ -385,7 +431,7 @@ class StrategyManager:
                 all_signals = home_signals + away_signals
                 best = max(all_signals, key=lambda s: s.confidence)
 
-                if best.confidence >= 7:  # High confidence threshold
+                if best.confidence >= self._conflict_min_confidence:
                     logger.info(
                         f"Conflict for game {game_id}: taking {best.side} "
                         f"with confidence {best.confidence}"

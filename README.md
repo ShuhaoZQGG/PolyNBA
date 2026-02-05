@@ -38,6 +38,26 @@ You can also use the console script after installing as a package:
 polynba --mode paper
 ```
 
+## Test game (simulation)
+To test the bot without a real NBA game or Polymarket API, use **test game mode**. It runs a single mock game with a time series of randomly generated bid/ask prices so you can exercise the full loop (edge detection, strategies, paper orders) locally.
+
+```bash
+python -m polynba --test-game
+```
+
+Defaults: 20 price ticks, 5-second loop interval, and the bot stops after 20 iterations. Optional:
+
+- **`--test-game-ticks N`** – Number of price ticks (and game-state steps). Each loop iteration consumes the next tick.
+- **`--max-iterations N`** – Override how many iterations to run (e.g. `--max-iterations 10`).
+
+Example: short run with 3 ticks and no Claude:
+
+```bash
+python -m polynba --test-game --test-game-ticks 3 --max-iterations 3 --no-claude
+```
+
+In test game mode the bot skips Polymarket verification and game selection; it uses a synthetic “Test Home vs Test Away” game and a pre-generated random price series.
+
 ## CLI options
 ```text
 --mode paper|live           Trading mode (default: paper)
@@ -46,6 +66,8 @@ polynba --mode paper
 --bankroll FLOAT            Initial bankroll in USDC
 --interval INT              Loop interval in seconds
 --max-iterations INT        Stop after N iterations
+--test-game                 Mock game + time-series prices (no real API)
+--test-game-ticks N         Number of price ticks for --test-game (default: 20)
 --no-claude                 Disable Claude analysis
 --log-level LEVEL           DEBUG|INFO|WARNING|ERROR
 --analyze                   Show performance summary and exit

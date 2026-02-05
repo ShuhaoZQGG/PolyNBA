@@ -33,6 +33,9 @@ Examples:
 
   # Run for specific number of iterations
   python -m polynba --mode paper --max-iterations 100
+
+  # Run with mock test game (no real NBA/Polymarket)
+  python -m polynba --test-game --test-game-ticks 20
         """,
     )
 
@@ -138,6 +141,136 @@ Examples:
         default=None,
         help="Game selection: comma-separated 1-based indices (e.g. 1,3) or 'all'. Skips interactive prompt when set.",
     )
+    parser.add_argument(
+        "--test-game",
+        action="store_true",
+        help="Use mock test game with time-series prices (no real NBA or Polymarket API).",
+    )
+    parser.add_argument(
+        "--test-game-ticks",
+        type=int,
+        default=None,
+        help="Number of price ticks / game states for --test-game (default: 20).",
+    )
+    # Edge (buy) filters
+    parser.add_argument(
+        "--min-edge",
+        type=float,
+        default=None,
+        metavar="PCT",
+        help="Minimum edge %% to consider a bet (overrides config).",
+    )
+    parser.add_argument(
+        "--min-edge-strategy-conservative",
+        type=float,
+        default=None,
+        metavar="PCT",
+        help="Override minimum edge %% for conservative strategy entry rule (e.g. 3.0).",
+    )
+    parser.add_argument(
+        "--min-edge-strategy-aggressive",
+        type=float,
+        default=None,
+        metavar="PCT",
+        help="Override minimum edge %% for aggressive strategy entry rule (e.g. 5.0).",
+    )
+    parser.add_argument(
+        "--max-edge",
+        type=float,
+        default=None,
+        metavar="PCT",
+        help="Maximum edge %% (filter suspiciously high; overrides config).",
+    )
+    parser.add_argument(
+        "--min-confidence",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Minimum confidence 1-10 (overrides config).",
+    )
+    parser.add_argument(
+        "--min-market-price",
+        type=float,
+        default=None,
+        metavar="P",
+        help="Minimum market price 0-1 (overrides config).",
+    )
+    parser.add_argument(
+        "--max-market-price",
+        type=float,
+        default=None,
+        metavar="P",
+        help="Maximum market price 0-1 (overrides config).",
+    )
+    parser.add_argument(
+        "--min-time-remaining",
+        type=int,
+        default=None,
+        metavar="SECS",
+        help="Minimum seconds remaining in game to allow buy (overrides config).",
+    )
+    parser.add_argument(
+        "--exclude-overtime",
+        action="store_true",
+        default=None,
+        help="Do not allow buys in overtime (overrides config).",
+    )
+    parser.add_argument(
+        "--no-exclude-overtime",
+        action="store_true",
+        help="Allow buys in overtime (overrides config).",
+    )
+    # Exit (sell) overrides
+    parser.add_argument(
+        "--stop-loss-pct",
+        type=float,
+        default=None,
+        metavar="PCT",
+        help="Global stop-loss %% (overrides strategy; e.g. 10).",
+    )
+    parser.add_argument(
+        "--exit-before-seconds",
+        type=int,
+        default=None,
+        metavar="SECS",
+        help="Exit when time left <= SECS (overrides strategy; e.g. 60).",
+    )
+    parser.add_argument(
+        "--profit-target-pct",
+        type=float,
+        default=None,
+        metavar="PCT",
+        help="Global take-profit %% (overrides strategy; e.g. 15).",
+    )
+    # Risk / allocation
+    parser.add_argument(
+        "--max-portfolio-exposure",
+        type=float,
+        default=None,
+        metavar="PCT",
+        help="Max fraction of balance bettable 0-1 (e.g. 0.5 = 50%%).",
+    )
+    parser.add_argument(
+        "--conflict-min-confidence",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Take conflicting side only if confidence >= N (default 7).",
+    )
+    parser.add_argument(
+        "--kelly-multiplier",
+        type=float,
+        default=None,
+        metavar="X",
+        help="Scale strategy Kelly by X (e.g. 0.5 = half); overrides config.",
+    )
+    parser.add_argument(
+        "--min-position-usdc",
+        type=float,
+        default=None,
+        metavar="USD",
+        help="Skip signal if position size below USD (global min).",
+    )
 
     return parser.parse_args()
 
@@ -183,6 +316,54 @@ def main() -> int:
     if args.instance_id is not None:
         config.command_server_port = 8765 + args.instance_id
         config.instance_id = args.instance_id
+
+    if args.test_game:
+        config.test_game = True
+        config.test_game_ticks = args.test_game_ticks
+        if config.loop_interval == 30:
+            config.loop_interval = 5
+        # Leave max_iterations unchanged (None = unlimited), like a real game
+
+    # Edge (buy) overrides
+    if args.min_edge is not None:
+        config.min_edge_percent = args.min_edge
+    overrides = dict(getattr(config, "min_edge_strategy_overrides", None) or {})
+    if args.min_edge_strategy_conservative is not None:
+        overrides["conservative"] = args.min_edge_strategy_conservative
+    if args.min_edge_strategy_aggressive is not None:
+        overrides["aggressive"] = args.min_edge_strategy_aggressive
+    if overrides:
+        config.min_edge_strategy_overrides = overrides
+    if args.max_edge is not None:
+        config.max_edge_percent = args.max_edge
+    if args.min_confidence is not None:
+        config.min_confidence = args.min_confidence
+    if args.min_market_price is not None:
+        config.min_market_price = args.min_market_price
+    if args.max_market_price is not None:
+        config.max_market_price = args.max_market_price
+    if args.min_time_remaining is not None:
+        config.min_time_remaining_seconds = args.min_time_remaining
+    if args.exclude_overtime is True:
+        config.exclude_overtime = True
+    if args.no_exclude_overtime is True:
+        config.exclude_overtime = False
+    # Exit (sell) overrides
+    if args.stop_loss_pct is not None:
+        config.exit_stop_loss_percent = args.stop_loss_pct
+    if args.exit_before_seconds is not None:
+        config.exit_before_seconds = args.exit_before_seconds
+    if args.profit_target_pct is not None:
+        config.exit_profit_target_percent = args.profit_target_pct
+    # Risk / allocation
+    if args.max_portfolio_exposure is not None:
+        config.max_portfolio_exposure = args.max_portfolio_exposure
+    if args.conflict_min_confidence is not None:
+        config.conflict_min_confidence = args.conflict_min_confidence
+    if args.kelly_multiplier is not None:
+        config.kelly_multiplier_override = args.kelly_multiplier
+    if args.min_position_usdc is not None:
+        config.min_position_usdc = args.min_position_usdc
 
     # Print startup banner
     print_banner(config)
@@ -285,8 +466,9 @@ async def bootstrap_game_selection(args: argparse.Namespace, config: BotConfig) 
 
 
 async def async_main(args: argparse.Namespace, config: BotConfig) -> None:
-    """Bootstrap game selection then run the bot."""
-    await bootstrap_game_selection(args, config)
+    """Bootstrap game selection then run the bot (skip selection in test-game mode)."""
+    if not config.test_game:
+        await bootstrap_game_selection(args, config)
     await run_bot_with_config(config)
 
 
@@ -327,6 +509,38 @@ def print_banner(config: BotConfig) -> None:
     print(f"  Strategies: {', '.join(config.active_strategies or ['default'])}")
     print(f"  Loop interval: {config.loop_interval}s")
     print(f"  Claude AI: {'enabled' if config.claude_enabled else 'disabled'}")
+    if config.test_game:
+        print(f"  Test game: enabled ({config.test_game_ticks or 20} ticks)")
+    print(
+        f"  Edge: min={config.min_edge_percent}% max={config.max_edge_percent}% "
+        f"conf>={config.min_confidence} time>={config.min_time_remaining_seconds}s "
+        f"OT={'excl' if config.exclude_overtime else 'ok'}"
+    )
+    print(
+        f"  Bettable: {config.max_portfolio_exposure:.0%} of balance | "
+        f"Conflict conf>={config.conflict_min_confidence}"
+    )
+    if (
+        config.exit_stop_loss_percent is not None
+        or config.exit_before_seconds is not None
+        or config.exit_profit_target_percent is not None
+    ):
+        parts = []
+        if config.exit_stop_loss_percent is not None:
+            parts.append(f"stop={config.exit_stop_loss_percent}%")
+        if config.exit_before_seconds is not None:
+            parts.append(f"exit_before={config.exit_before_seconds}s")
+        if config.exit_profit_target_percent is not None:
+            parts.append(f"profit={config.exit_profit_target_percent}%")
+        print(f"  Exit overrides: {', '.join(parts)}")
+    if config.kelly_multiplier_override is not None:
+        print(f"  Kelly override: {config.kelly_multiplier_override}x")
+    if getattr(config, "min_edge_strategy_overrides", None):
+        parts = [f"{k}={v}%" for k, v in (config.min_edge_strategy_overrides or {}).items()]
+        if parts:
+            print(f"  Strategy min edge overrides: {', '.join(parts)}")
+    if config.min_position_usdc is not None:
+        print(f"  Min position: ${config.min_position_usdc}")
     if config.instance_id is not None:
         print(f"  Instance: {config.instance_id} (port {8765 + config.instance_id})")
     if config.allowed_game_ids:
