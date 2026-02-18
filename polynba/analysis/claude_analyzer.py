@@ -32,7 +32,7 @@ class ClaudeAnalysisResponse(BaseModel):
 class ClaudeAnalysisConfig:
     """Configuration for Claude analyzer."""
 
-    model: str = "claude-sonnet-4-5-20250514"
+    model: str = "claude-haiku-4-5-20251001"
     max_tokens: int = 1024
     temperature: float = 0.3
     min_interval_seconds: float = 120.0  # Minimum seconds between analyses

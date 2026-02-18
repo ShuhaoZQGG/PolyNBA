@@ -459,6 +459,7 @@ class LiveTradingExecutor(TradingExecutor):
         private_key: str,
         rpc_url: str = "https://polygon-rpc.com",
         chain_id: int = 137,
+        funder: Optional[str] = None,
     ):
         """Initialize live trading executor.
 
@@ -466,10 +467,13 @@ class LiveTradingExecutor(TradingExecutor):
             private_key: Ethereum private key for signing
             rpc_url: Polygon RPC endpoint
             chain_id: Chain ID (137 for Polygon mainnet)
+            funder: Proxy wallet address that holds funds (for proxy wallets).
+                   If set, uses signature_type=2 (POLY_PROXY).
         """
         self._private_key = private_key
         self._rpc_url = rpc_url
         self._chain_id = chain_id
+        self._funder = funder
         self._client = None
         self._orders: dict[str, Order] = {}
 
@@ -479,11 +483,18 @@ class LiveTradingExecutor(TradingExecutor):
             try:
                 from py_clob_client.client import ClobClient
 
-                self._client = ClobClient(
-                    host="https://clob.polymarket.com",
-                    key=self._private_key,
-                    chain_id=self._chain_id,
-                )
+                client_kwargs = {
+                    "host": "https://clob.polymarket.com",
+                    "key": self._private_key,
+                    "chain_id": self._chain_id,
+                }
+                if self._funder:
+                    client_kwargs["signature_type"] = 1
+                    client_kwargs["funder"] = self._funder
+                self._client = ClobClient(**client_kwargs)
+                # Derive and set API credentials for authenticated endpoints
+                creds = self._client.create_or_derive_api_creds()
+                self._client.set_api_creds(creds)
             except ImportError:
                 raise ImportError(
                     "py-clob-client is required for live trading. "
@@ -505,12 +516,15 @@ class LiveTradingExecutor(TradingExecutor):
             client = await self._get_client()
 
             # Convert to CLOB API format
-            order_args = {
-                "token_id": token_id,
-                "price": float(price),
-                "size": float(size),
-                "side": "BUY" if side == TradeSide.BUY else "SELL",
-            }
+            from py_clob_client.clob_types import OrderArgs
+            from py_clob_client.order_builder.constants import BUY, SELL
+
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=float(price),
+                size=float(size),
+                side=BUY if side == TradeSide.BUY else SELL,
+            )
 
             # Create and sign order
             signed_order = client.create_order(order_args)
@@ -572,14 +586,17 @@ class LiveTradingExecutor(TradingExecutor):
                 # Update from response
                 status_map = {
                     "OPEN": OrderStatus.OPEN,
+                    "MATCHED": OrderStatus.FILLED,
                     "FILLED": OrderStatus.FILLED,
+                    "CANCELED": OrderStatus.CANCELLED,
                     "CANCELLED": OrderStatus.CANCELLED,
                 }
                 order.status = status_map.get(
                     response.get("status", "OPEN"),
                     OrderStatus.OPEN
                 )
-                order.filled_size = Decimal(str(response.get("sizeFilled", 0)))
+                order.filled_size = Decimal(str(response.get("size_matched", 0)))
+                order.avg_fill_price = Decimal(str(response.get("price", 0)))
                 order.updated_at = datetime.now()
 
             return order
@@ -623,11 +640,26 @@ class LiveTradingExecutor(TradingExecutor):
         """Get balance from CLOB."""
         try:
             client = await self._get_client()
-            # Balance check would depend on wallet integration
-            # This is a simplified version
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+            result = client.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+            # Balance is in USDC raw units (6 decimals)
+            raw_balance = Decimal(result.get("balance", "0"))
+            usdc_balance = raw_balance / Decimal("1000000")
+
+            # Estimate locked balance from open orders
+            open_orders = await self.get_open_orders()
+            locked = sum(
+                o.remaining_size * o.price
+                for o in open_orders
+                if o.side == TradeSide.BUY
+            )
+
             return Balance(
-                usdc=Decimal("0"),
-                locked_usdc=Decimal("0"),
+                usdc=usdc_balance,
+                locked_usdc=locked,
             )
 
         except Exception as e:
@@ -635,7 +667,11 @@ class LiveTradingExecutor(TradingExecutor):
             return Balance(usdc=Decimal("0"), locked_usdc=Decimal("0"))
 
     async def get_market_data(self, market_id: str) -> Optional[MarketData]:
-        """Get market data from CLOB."""
+        """Get market data from CLOB.
+
+        Note: market_id should be a token_id, as the CLOB API's
+        get_order_book operates on token IDs, not condition IDs.
+        """
         try:
             client = await self._get_client()
             book = client.get_order_book(market_id)
@@ -643,11 +679,11 @@ class LiveTradingExecutor(TradingExecutor):
             if not book:
                 return None
 
-            bids = book.get("bids", [])
-            asks = book.get("asks", [])
+            bids = book.bids or []
+            asks = book.asks or []
 
-            best_bid = Decimal(str(bids[0]["price"])) if bids else Decimal("0")
-            best_ask = Decimal(str(asks[0]["price"])) if asks else Decimal("1")
+            best_bid = Decimal(bids[0].price) if bids else Decimal("0")
+            best_ask = Decimal(asks[0].price) if asks else Decimal("1")
 
             return MarketData(
                 market_id=market_id,

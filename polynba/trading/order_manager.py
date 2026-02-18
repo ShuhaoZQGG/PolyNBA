@@ -113,8 +113,8 @@ class OrderManager:
         Returns:
             OrderResult with order details
         """
-        # Get current market price
-        market_data = await self._executor.get_market_data(market_id)
+        # Get current market price (use token_id as key for CLOB orderbook lookup)
+        market_data = await self._executor.get_market_data(token_id)
         initial_price = Decimal("0.5")  # Default mid
 
         if market_data:
@@ -234,11 +234,14 @@ class OrderManager:
 
             # Check price during delay
             if self._config.enable_auto_cancel:
-                should_cancel = await self._check_price_deviation(pending)
-                if should_cancel:
-                    await self._cancel_pending_order(order_id, "Price deviation")
-                    completed.append(order_id)
-                    continue
+                try:
+                    should_cancel = await self._check_price_deviation(pending)
+                    if should_cancel:
+                        await self._cancel_pending_order(order_id, "Price deviation")
+                        completed.append(order_id)
+                        continue
+                except Exception as e:
+                    logger.debug(f"Price deviation check failed for {order_id}: {e}")
 
             # Check if delay period complete
             if elapsed >= self._config.delay_seconds:
@@ -256,7 +259,7 @@ class OrderManager:
             True if order should be cancelled
         """
         market_data = await self._executor.get_market_data(
-            pending.order.market_id
+            pending.order.token_id
         )
 
         if not market_data:

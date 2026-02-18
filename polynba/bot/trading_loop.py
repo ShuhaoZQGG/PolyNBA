@@ -263,6 +263,7 @@ class TradingBot:
                 private_key=private_key,
                 rpc_url=os.environ.get("POLYGON_RPC_URL", "https://polygon-rpc.com"),
                 chain_id=int(os.environ.get("CHAIN_ID", "137")),
+                funder=os.environ.get("POLYMARKET_FUNDER_ADDRESS"),
             )
             logger.info("Using LIVE trading executor")
         else:
@@ -368,6 +369,18 @@ class TradingBot:
 
         # Load strategies
         self._strategy_manager.load_strategies(self._config.active_strategies)
+
+        # In live mode, fetch real balance and update initial balance
+        if self._config.mode == "live":
+            try:
+                balance = await self._executor.get_balance()
+                if balance.usdc > 0:
+                    self._portfolio_display._initial_balance = balance.usdc
+                    self._performance._initial_equity = float(balance.usdc)
+                    self._strategy_manager.update_bankroll(balance.usdc)
+                    logger.info(f"Live balance: ${balance.usdc:.2f} USDC")
+            except Exception as e:
+                logger.warning(f"Could not fetch live balance: {e}")
 
         # Verify Polymarket API connection and log available markets
         await self._verify_polymarket_connection()
@@ -630,7 +643,7 @@ class TradingBot:
         )
 
         # Optionally enhance with Claude analysis
-        if self._claude_analyzer and abs(estimate.edge_percentage) >= 5:
+        if self._claude_analyzer and abs(estimate.edge_percentage) >= self._config.min_edge_percent:
             await self._enhance_with_claude(
                 game_state, home_market_price, estimate, home_stats, away_stats
             )

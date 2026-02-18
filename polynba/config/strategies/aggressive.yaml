@@ -15,7 +15,7 @@ entry_rules:
       type: "threshold"
       field: "edge_percentage"
       operator: ">="
-      value: 5.0  # Lower edge threshold
+      value: 3.0  # Lower edge threshold
 
     - name: "minimum_confidence"
       type: "threshold"
