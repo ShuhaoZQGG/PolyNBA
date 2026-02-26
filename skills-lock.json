@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "github-projects": {
+      "source": "existential-birds/beagle",
+      "sourceType": "github",
+      "computedHash": "2c5edde900016269bdd0dd173c0a700512abe91e5ca7a56745e9bc8545d06d38"
+    }
+  }
+}
