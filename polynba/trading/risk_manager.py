@@ -28,6 +28,9 @@ class RiskLimits:
     max_daily_loss_usdc: Decimal = Decimal("100")
     stop_loss_percent: float = 10.0
 
+    # Hard circuit breaker per position (absolute loss limit, safety net)
+    hard_loss_limit_percent: float = 30.0
+
     # Profit taking
     take_profit_percent: float = 15.0
 
@@ -238,6 +241,34 @@ class RiskManager:
             return True, "take_profit"
 
         return False, None
+
+    def check_hard_loss_limit(
+        self,
+        position: Position,
+        current_price: Decimal,
+    ) -> bool:
+        """Check if position has hit the hard loss limit (circuit breaker).
+
+        This is a safety net that forces an exit regardless of strategy
+        stop-loss settings, in case the normal stop-loss mechanism fails.
+
+        Args:
+            position: Position to check
+            current_price: Current market price
+
+        Returns:
+            True if position must be force-exited
+        """
+        pnl_percent = position.unrealized_pnl_percent(current_price)
+
+        if pnl_percent <= -self._limits.hard_loss_limit_percent:
+            logger.warning(
+                f"HARD CIRCUIT BREAKER: position {position.token_id} at "
+                f"{pnl_percent:.1f}% loss (limit: -{self._limits.hard_loss_limit_percent}%)"
+            )
+            return True
+
+        return False
 
     def record_trade_result(
         self,

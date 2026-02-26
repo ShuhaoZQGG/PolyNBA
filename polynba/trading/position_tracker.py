@@ -108,8 +108,12 @@ class PositionTracker:
     def __init__(self):
         """Initialize position tracker."""
         self._positions: dict[str, Position] = {}  # token_id -> Position
+        self._closed_realized_pnl: Decimal = Decimal("0")  # PnL from removed positions
         self._trades: list[Trade] = []
         self._trade_counter = 0
+        self._completed_trades = 0
+        self._winning_trades = 0
+        self._losing_trades = 0
 
     def record_fill(self, order: Order) -> Optional[Trade]:
         """Record an order fill and update position.
@@ -195,9 +199,15 @@ class PositionTracker:
                     position.avg_entry_price = trade.price
                     position.total_cost = remaining * trade.price
                 else:
-                    # Position closed
-                    position.size = Decimal("0")
-                    position.total_cost = Decimal("0")
+                    # Position closed — accumulate realized PnL and remove
+                    self._closed_realized_pnl += position.realized_pnl
+                    self._completed_trades += 1
+                    if position.realized_pnl > 0:
+                        self._winning_trades += 1
+                    elif position.realized_pnl < 0:
+                        self._losing_trades += 1
+                    del self._positions[trade.token_id]
+                    return
             else:
                 # Partial close
                 close_size = trade.size
@@ -303,8 +313,10 @@ class PositionTracker:
         return total
 
     def total_realized_pnl(self) -> Decimal:
-        """Get total realized P&L across all positions."""
-        return sum(p.realized_pnl for p in self._positions.values())
+        """Get total realized P&L across all positions (open + closed)."""
+        return self._closed_realized_pnl + sum(
+            p.realized_pnl for p in self._positions.values()
+        )
 
     def total_exposure(self) -> Decimal:
         """Get total notional exposure."""
@@ -317,13 +329,31 @@ class PositionTracker:
         return {
             "open_positions": len(positions),
             "total_trades": len(self._trades),
+            "completed_trades": self._completed_trades,
+            "winning_trades": self._winning_trades,
+            "losing_trades": self._losing_trades,
             "total_realized_pnl": float(self.total_realized_pnl()),
             "total_exposure": float(self.total_exposure()),
         }
 
+    def write_off_dust(self, token_id: str) -> None:
+        """Write off a dust position that's too small to sell.
+
+        Removes the position and accumulates any realized PnL.
+        """
+        position = self._positions.get(token_id)
+        if position:
+            self._closed_realized_pnl += position.realized_pnl
+            del self._positions[token_id]
+            logger.info(f"Dust position written off: {token_id}")
+
     def reset(self) -> None:
         """Reset all positions and trades."""
         self._positions.clear()
+        self._closed_realized_pnl = Decimal("0")
         self._trades.clear()
         self._trade_counter = 0
+        self._completed_trades = 0
+        self._winning_trades = 0
+        self._losing_trades = 0
         logger.info("Position tracker reset")
