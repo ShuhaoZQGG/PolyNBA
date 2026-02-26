@@ -114,6 +114,13 @@ class TeamStrengthFactor:
         home = input_data.home_stats
         away = input_data.away_stats
 
+        # Log net rating data source
+        if home.net_rating != 0.0 or away.net_rating != 0.0:
+            logger.info(
+                f"  Team strength: {home.team_abbreviation} net_rating={home.net_rating:+.1f}, "
+                f"{away.team_abbreviation} net_rating={away.net_rating:+.1f}"
+            )
+
         # Calculate efficiency comparison
         efficiency = self._analyze_efficiency(home, away)
 
@@ -126,16 +133,21 @@ class TeamStrengthFactor:
         home_away_score = self._score_home_away_splits(home, away)
         streak_score = self._score_streaks(home, away)
 
-        # Combine with weights
-        raw_score = (
-            net_rating_score * self._net_rating_weight
-            + record_score * self._record_weight
-            + home_away_score * self._home_away_weight
-            + streak_score * self._streak_weight
-        )
+        # Log warning and adjust weights when net_rating data is unreliable
+        if home.net_rating == 0.0 and away.net_rating == 0.0:
+            logger.warning(
+                f"Net ratings are 0.0 for both teams ({home.team_abbreviation} vs {away.team_abbreviation}). "
+                f"Using records as primary quality signal."
+            )
 
-        # Add home court advantage adjustment
-        raw_score += 10  # ~10 points for home court
+        # Combine with weights (adjusted when net_rating data is unavailable)
+        nr_w, rec_w, ha_w, str_w = self._get_effective_weights(home, away)
+        raw_score = (
+            net_rating_score * nr_w
+            + record_score * rec_w
+            + home_away_score * ha_w
+            + streak_score * str_w
+        )
 
         # Analyze injury impact if context available
         injury_impact = 0
@@ -165,6 +177,13 @@ class TeamStrengthFactor:
             injury_impact=injury_impact,
             reasoning=reasoning,
         )
+
+    def _get_effective_weights(self, home: TeamStats, away: TeamStats) -> tuple[float, float, float, float]:
+        """Get effective weights, adjusting when net_rating data is unavailable."""
+        if home.net_rating == 0.0 and away.net_rating == 0.0:
+            # Net rating unavailable — upweight records
+            return (0.10, 0.45, 0.25, 0.20)  # net_rating, record, home_away, streak
+        return (self._net_rating_weight, self._record_weight, self._home_away_weight, self._streak_weight)
 
     def _analyze_efficiency(
         self, home: TeamStats, away: TeamStats
@@ -225,9 +244,9 @@ class TeamStrengthFactor:
         return diff * 5
 
     def _score_records(self, home: TeamStats, away: TeamStats) -> float:
-        """Score based on win-loss records."""
-        home_wp = home.win_percentage
-        away_wp = away.win_percentage
+        """Score based on win-loss records (Pythagorean expected win%)."""
+        home_wp = home.pythagorean_win_pct
+        away_wp = away.pythagorean_win_pct
         diff = home_wp - away_wp  # -1 to +1
 
         return diff * 100  # Scale to -100 to +100
@@ -307,9 +326,6 @@ class TeamStrengthFactor:
         elif away.current_streak <= -3:
             home_adv.append(f"Opponent on {-away.current_streak} game losing streak")
 
-        # Home court
-        home_adv.append("Home court advantage")
-
         return home_adv, away_adv
 
     def _generate_reasoning(
@@ -346,5 +362,9 @@ class TeamStrengthFactor:
             assessment = f"{home.team_abbreviation} has strength advantage"
         else:
             assessment = f"{away.team_abbreviation} has strength advantage"
+
+        # Note data quality issues
+        if home.net_rating == 0.0 and away.net_rating == 0.0:
+            parts.append("Note: team net rating data unavailable, using records as primary quality signal.")
 
         return f"{assessment}. {'. '.join(parts)}."

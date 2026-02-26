@@ -65,10 +65,15 @@ class EdgeFilter:
     min_edge_percent: float = 5.0
     max_edge_percent: float = 50.0  # Suspiciously high edges
     min_confidence: int = 5
-    min_market_price: Decimal = Decimal("0.10")
-    max_market_price: Decimal = Decimal("0.90")
+    min_market_price: Decimal = Decimal("0.15")
+    max_market_price: Decimal = Decimal("0.75")
     min_time_remaining_seconds: int = 300  # 5 minutes
     exclude_overtime: bool = False
+
+    # Volatility filter: raise min_edge when game is tight + late
+    volatility_score_threshold: int = 5  # abs(differential) below this = "tight"
+    volatility_period_threshold: int = 3  # Period >= this = "late" (3 = Q3+)
+    volatility_edge_multiplier: float = 1.5  # Multiply min_edge by this when volatile
 
 
 class EdgeDetector:
@@ -119,11 +124,21 @@ class EdgeDetector:
         if not self._passes_basic_filters(game_state, estimate):
             return opportunities
 
+        # Compute effective min edge (raised during volatile conditions)
+        effective_min_edge = self._effective_min_edge(game_state)
+        if effective_min_edge > self._filter.min_edge_percent:
+            logger.info(
+                f"  [Volatility filter] Score diff={game_state.score_differential}, "
+                f"period={game_state.period.value} → min_edge raised "
+                f"{self._filter.min_edge_percent}% → {effective_min_edge:.2f}%"
+            )
+
         # Check home team edge
         if self._is_valid_edge(
             estimate.edge_percentage,
             estimate.confidence,
             estimate.market_price,
+            effective_min_edge,
         ):
             opportunities.append(
                 EdgeOpportunity(
@@ -156,6 +171,7 @@ class EdgeDetector:
             away_edge_percent,
             estimate.confidence,
             away_buy_price,
+            effective_min_edge,
         ):
             opportunities.append(
                 EdgeOpportunity(
@@ -195,15 +211,31 @@ class EdgeDetector:
 
         return True
 
+    def _effective_min_edge(self, game_state: GameState) -> float:
+        """Compute the effective min_edge_percent, raised during volatile conditions.
+
+        Volatility is defined as tight score + late game (both must be true).
+        """
+        filt = self._filter
+        is_tight = abs(game_state.score_differential) < filt.volatility_score_threshold
+        is_late = game_state.period.value >= filt.volatility_period_threshold
+
+        if is_tight and is_late:
+            effective = filt.min_edge_percent * filt.volatility_edge_multiplier
+            return effective
+        return filt.min_edge_percent
+
     def _is_valid_edge(
         self,
         edge_percent: float,
         confidence: int,
         market_price: Decimal,
+        effective_min_edge: Optional[float] = None,
     ) -> bool:
         """Check if an edge opportunity is valid."""
+        min_edge = effective_min_edge if effective_min_edge is not None else self._filter.min_edge_percent
         # Edge size
-        if edge_percent < self._filter.min_edge_percent:
+        if edge_percent < min_edge:
             return False
 
         if edge_percent > self._filter.max_edge_percent:

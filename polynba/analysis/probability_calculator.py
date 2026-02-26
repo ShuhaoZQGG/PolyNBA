@@ -243,6 +243,10 @@ class ProbabilityCalculator:
         if abs(combined_score) > 75:
             confidence += 1
 
+        # Reduce confidence when net_rating data is unavailable
+        if strength.efficiency.home_net_rating == 0.0 and strength.efficiency.away_net_rating == 0.0:
+            confidence -= 1
+
         # Lower confidence in very close games
         if context.clutch.is_clutch and context.clutch.pressure_level > 80:
             confidence -= 1
@@ -289,6 +293,10 @@ class ProbabilityCalculator:
 
         if key_factors:
             parts.append(f"Key factors: {', '.join(key_factors)}.")
+
+        # Note data quality issues
+        if strength.efficiency.home_net_rating == 0.0 and strength.efficiency.away_net_rating == 0.0:
+            parts.append("Note: team net rating data unavailable, using records as primary quality signal.")
 
         return " ".join(parts)
 
