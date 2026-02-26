@@ -209,14 +209,18 @@ class StrategyManager:
                     )
                     continue
 
-                # Calculate position size
+                # Calculate position size using total bankroll for Kelly
+                # (so Kelly fraction produces meaningful sizes), then cap
+                # by the strategy's allocated capital.
                 available_capital = self._get_available_capital(strategy)
                 size = self._rule_engine.calculate_position_size(
                     strategy,
                     opportunity,
-                    available_capital,
+                    self._total_bankroll,
                     kelly_multiplier_override=self._kelly_multiplier_override,
+                    time_remaining_seconds=game_state.total_seconds_remaining,
                 )
+                size = min(size, available_capital)
 
                 min_size = strategy.position_sizing.min_position_usdc
                 if self._min_position_usdc_override is not None:

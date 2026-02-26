@@ -65,12 +65,21 @@ class ProfitTarget:
 
 
 @dataclass
+class StopLossWideningBucket:
+    """Time-based stop loss widening bucket."""
+
+    time_remaining_max: int  # Seconds remaining threshold (<=)
+    multiplier: float  # Multiply base stop loss by this
+
+
+@dataclass
 class ExitRules:
     """Exit rules configuration."""
 
     profit_targets: list[ProfitTarget] = field(default_factory=list)
     stop_loss_percent: float = 10.0
     time_stop_seconds: int = 60
+    late_game_widening: list[StopLossWideningBucket] = field(default_factory=list)
 
 
 @dataclass
@@ -83,6 +92,8 @@ class PositionSizing:
     min_position_usdc: float = 10.0
     fixed_size_usdc: float = 50.0  # For fixed method
     percentage_of_bankroll: float = 0.05  # For percentage method
+    late_game_seconds: int = 720  # Threshold for late-game scaling (default 12 min = start of Q4)
+    late_game_multiplier: float = 1.0  # Scale factor for late-game sizing (1.0 = no change)
 
 
 @dataclass
@@ -92,6 +103,9 @@ class StrategyRiskLimits:
     max_concurrent_positions: int = 5
     max_daily_loss_usdc: float = 200.0
     max_position_per_game: int = 1
+    cooldown_iterations: int = 0  # Iterations to wait after stop loss before re-entry
+    max_stop_losses_per_game: int = 0  # Max stop losses per game (0 = unlimited)
+    max_loss_per_game_usdc: float = 0.0  # Per-game loss cap in USDC (0 = unlimited)
 
 
 @dataclass
@@ -129,18 +143,25 @@ class StrategyLoader:
         Returns:
             Dict mapping strategy ID to config
         """
-        if not self._strategies_dir.exists():
-            logger.warning(f"Strategies directory not found: {self._strategies_dir}")
-            return {}
+        # Search directories: strategies/ and recommends/
+        search_dirs = [self._strategies_dir]
+        recommends_dir = self._strategies_dir.parent / "recommends"
+        if recommends_dir.exists():
+            search_dirs.append(recommends_dir)
 
-        for yaml_file in self._strategies_dir.glob("*.yaml"):
-            try:
-                strategy = self.load_file(yaml_file)
-                if strategy:
-                    self._strategies[strategy.id] = strategy
-                    logger.info(f"Loaded strategy: {strategy.metadata.name}")
-            except Exception as e:
-                logger.error(f"Failed to load strategy {yaml_file}: {e}")
+        for search_dir in search_dirs:
+            if not search_dir.exists():
+                logger.warning(f"Strategies directory not found: {search_dir}")
+                continue
+
+            for yaml_file in search_dir.glob("*.yaml"):
+                try:
+                    strategy = self.load_file(yaml_file)
+                    if strategy:
+                        self._strategies[strategy.id] = strategy
+                        logger.info(f"Loaded strategy: {strategy.metadata.name}")
+                except Exception as e:
+                    logger.error(f"Failed to load strategy {yaml_file}: {e}")
 
         return self._strategies
 
@@ -175,12 +196,18 @@ class StrategyLoader:
         if strategy_id in self._strategies:
             return self._strategies[strategy_id]
 
-        path = self._strategies_dir / f"{strategy_id}.yaml"
-        if not path.exists():
-            logger.warning(f"Strategy file not found: {path}")
-            return None
+        # Search in strategies/ and recommends/
+        search_dirs = [
+            self._strategies_dir,
+            self._strategies_dir.parent / "recommends",
+        ]
+        for search_dir in search_dirs:
+            path = search_dir / f"{strategy_id}.yaml"
+            if path.exists():
+                return self.load_file(path)
 
-        return self.load_file(path)
+        logger.warning(f"Strategy file not found: {strategy_id}")
+        return None
 
     def _parse_config(self, strategy_id: str, data: dict) -> StrategyConfig:
         """Parse YAML data into StrategyConfig."""
@@ -227,10 +254,24 @@ class StrategyLoader:
                     target_percentage=target.get("target_percentage", 10.0),
                 )
             )
+        # Parse late-game stop loss widening buckets
+        stop_loss_data = exit_data.get("stop_loss", {})
+        late_game_widening = []
+        for bucket in stop_loss_data.get("late_game_widening", []):
+            late_game_widening.append(
+                StopLossWideningBucket(
+                    time_remaining_max=bucket.get("time_remaining_max", 0),
+                    multiplier=bucket.get("multiplier", 1.0),
+                )
+            )
+        # Sort descending by time so first match = widest applicable bucket
+        late_game_widening.sort(key=lambda b: b.time_remaining_max, reverse=True)
+
         exit_rules = ExitRules(
             profit_targets=profit_targets,
-            stop_loss_percent=exit_data.get("stop_loss", {}).get("value", 10.0),
+            stop_loss_percent=stop_loss_data.get("value", 10.0),
             time_stop_seconds=exit_data.get("time_stop", {}).get("exit_before_seconds", 60),
+            late_game_widening=late_game_widening,
         )
 
         # Parse position sizing
@@ -242,6 +283,8 @@ class StrategyLoader:
             min_position_usdc=sizing_data.get("min_position_usdc", 10.0),
             fixed_size_usdc=sizing_data.get("fixed_size_usdc", 50.0),
             percentage_of_bankroll=sizing_data.get("percentage_of_bankroll", 0.05),
+            late_game_seconds=sizing_data.get("late_game_seconds", 720),
+            late_game_multiplier=sizing_data.get("late_game_multiplier", 1.0),
         )
 
         # Parse risk limits
@@ -250,6 +293,9 @@ class StrategyLoader:
             max_concurrent_positions=risk_data.get("max_concurrent_positions", 5),
             max_daily_loss_usdc=risk_data.get("max_daily_loss_usdc", 200.0),
             max_position_per_game=risk_data.get("max_position_per_game", 1),
+            cooldown_iterations=risk_data.get("cooldown_iterations", 0),
+            max_stop_losses_per_game=risk_data.get("max_stop_losses_per_game", 0),
+            max_loss_per_game_usdc=risk_data.get("max_loss_per_game_usdc", 0.0),
         )
 
         return StrategyConfig(

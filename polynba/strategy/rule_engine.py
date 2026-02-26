@@ -349,15 +349,30 @@ class RuleEngine:
                 f"{profit_target_percent_override:.1f}% -> no"
             )
 
-        # Check stop loss
-        stop_threshold = -stop_loss_pct
+        # Dynamic stop loss: widen for low-price positions where normal volatility exceeds %
+        entry_price = float(position.avg_entry_price)
+        effective_stop_loss = stop_loss_pct
+        if entry_price < 0.35:
+            # Scale: multiplier from 1.0 (at 0.35) to 2.0 (at 0.0)
+            multiplier = min(2.0, max(1.0, 2.0 - (entry_price / 0.35)))
+            effective_stop_loss = stop_loss_pct * multiplier
+
+        # Time-based widening for late-game volatility (stacks with price-based)
+        for bucket in exit_rules.late_game_widening:
+            if time_remaining_seconds <= bucket.time_remaining_max:
+                effective_stop_loss *= bucket.multiplier
+                break  # First matching bucket wins (sorted descending by time)
+
+        stop_threshold = -effective_stop_loss
         if pnl_percent <= stop_threshold:
             logger.info(
-                f"    -> Stop loss: PnL {pnl_percent:.1f}% <= {stop_threshold:.1f}% -> SELL"
+                f"    -> Stop loss: PnL {pnl_percent:.1f}% <= {stop_threshold:.1f}% "
+                f"(base={stop_loss_pct:.0f}%, effective={effective_stop_loss:.1f}%, entry@{entry_price:.2f}) -> SELL"
             )
-            return True, f"Stop loss triggered ({pnl_percent:.1f}%)"
+            return True, f"Stop loss triggered ({pnl_percent:.1f}%, threshold {stop_threshold:.1f}%)"
         logger.info(
-            f"    -> Stop loss: PnL {pnl_percent:.1f}% > {stop_threshold:.1f}% -> no"
+            f"    -> Stop loss: PnL {pnl_percent:.1f}% > {stop_threshold:.1f}% "
+            f"(base={stop_loss_pct:.0f}%, effective={effective_stop_loss:.1f}%, entry@{entry_price:.2f}) -> no"
         )
 
         # Check profit targets (time-based)
@@ -402,6 +417,7 @@ class RuleEngine:
         bankroll: Decimal,
         *,
         kelly_multiplier_override: Optional[float] = None,
+        time_remaining_seconds: Optional[int] = None,
     ) -> Decimal:
         """Calculate position size based on strategy rules.
 
@@ -410,6 +426,7 @@ class RuleEngine:
             opportunity: Edge opportunity
             bankroll: Available bankroll
             kelly_multiplier_override: If set, scale strategy kelly_multiplier by this (e.g. 0.5 = half)
+            time_remaining_seconds: Seconds remaining in game (for late-game scaling)
 
         Returns:
             Position size in USDC
@@ -429,6 +446,18 @@ class RuleEngine:
             size = float(bankroll) * sizing.percentage_of_bankroll
         else:
             size = sizing.min_position_usdc
+
+        # Late-game position size scaling
+        if (
+            time_remaining_seconds is not None
+            and sizing.late_game_multiplier < 1.0
+            and time_remaining_seconds <= sizing.late_game_seconds
+        ):
+            size *= sizing.late_game_multiplier
+            logger.info(
+                f"    Late-game sizing: {time_remaining_seconds}s remaining "
+                f"(<= {sizing.late_game_seconds}s), size scaled by {sizing.late_game_multiplier:.1%}"
+            )
 
         # Apply limits
         size = max(sizing.min_position_usdc, size)

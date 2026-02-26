@@ -39,7 +39,7 @@ entry_rules:
       type: "threshold"
       field: "market_price"
       operator: "<="
-      value: 0.85
+      value: 0.75
 
     - name: "no_risk_flags"
       type: "list_empty"
@@ -56,6 +56,9 @@ exit_rules:
 
   stop_loss:
     value: 10.0
+    late_game_widening:
+      - time_remaining_max: 360   # <= 6 min: 1.5x → 15%
+        multiplier: 1.5
 
   time_stop:
     exit_before_seconds: 60  # Exit 1 minute before end
@@ -70,3 +73,6 @@ risk_limits:
   max_concurrent_positions: 3
   max_daily_loss_usdc: 150
   max_position_per_game: 1
+  cooldown_iterations: 10
+  max_stop_losses_per_game: 2
+  max_loss_per_game_usdc: 10
