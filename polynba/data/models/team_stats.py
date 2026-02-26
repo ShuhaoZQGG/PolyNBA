@@ -86,6 +86,19 @@ class TeamStats:
         return self.away_wins / total if total > 0 else 0.0
 
     @property
+    def pythagorean_win_pct(self) -> float:
+        """Pythagorean expected win% based on points scored/allowed.
+
+        Uses Morey's exponent (13.91) for NBA.
+        """
+        if self.points_per_game <= 0 or self.points_allowed_per_game <= 0:
+            return self.win_percentage  # fall back to actual
+        exp = 13.91
+        ppg_exp = self.points_per_game ** exp
+        pa_exp = self.points_allowed_per_game ** exp
+        return ppg_exp / (ppg_exp + pa_exp)
+
+    @property
     def is_elite_offense(self) -> bool:
         """Check if team has elite offense (top 5)."""
         return self.offensive_rating_rank <= 5
@@ -165,7 +178,7 @@ class PlayerInjury:
     @property
     def is_questionable(self) -> bool:
         """Check if player status is uncertain."""
-        return self.status.lower() in ("questionable", "game-time decision")
+        return self.status.lower() in ("questionable", "game-time decision", "day-to-day")
 
 
 @dataclass

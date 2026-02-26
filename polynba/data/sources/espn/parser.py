@@ -11,6 +11,7 @@ from ...models import (
     GameSummary,
     Period,
     PlayEvent,
+    PlayerInjury,
     TeamGameState,
     TeamStats,
 )
@@ -342,12 +343,58 @@ class ESPNParser:
         )
 
     @staticmethod
-    def parse_team_stats(data: dict[str, Any], team_id: str) -> Optional[TeamStats]:
+    def _parse_team_info_record(
+        team_info_data: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Extract record stats from /teams/{id} response.
+
+        The /teams/{id} endpoint returns record.items[] with stats arrays
+        containing avgPointsFor, avgPointsAgainst, differential, streak,
+        and home/away splits.
+
+        Returns dict with keys: ppg, pa, differential, streak,
+        home_wins, home_losses, away_wins, away_losses, wins, losses, win_pct.
+        """
+        result: dict[str, Any] = {}
+        team = team_info_data.get("team", {})
+        record = team.get("record", {})
+        items = record.get("items", [])
+
+        for item in items:
+            item_type = item.get("type", "")
+            stats_list = item.get("stats", [])
+            stats_map = {s["name"]: s["value"] for s in stats_list if "name" in s}
+
+            if item_type == "total":
+                result["ppg"] = float(stats_map.get("avgPointsFor", 0.0))
+                result["pa"] = float(stats_map.get("avgPointsAgainst", 0.0))
+                result["differential"] = float(stats_map.get("differential", 0.0))
+                result["streak"] = int(stats_map.get("streak", 0))
+                result["wins"] = int(stats_map.get("wins", 0))
+                result["losses"] = int(stats_map.get("losses", 0))
+                result["win_pct"] = float(stats_map.get("winPercent", 0.0))
+            elif item_type == "home":
+                result["home_wins"] = int(stats_map.get("wins", 0))
+                result["home_losses"] = int(stats_map.get("losses", 0))
+            elif item_type == "road":
+                result["away_wins"] = int(stats_map.get("wins", 0))
+                result["away_losses"] = int(stats_map.get("losses", 0))
+
+        return result
+
+    @staticmethod
+    def parse_team_stats(
+        data: dict[str, Any],
+        team_id: str,
+        team_info_data: dict[str, Any] | None = None,
+    ) -> Optional[TeamStats]:
         """Parse team statistics response.
 
         Args:
-            data: ESPN team stats JSON response
+            data: ESPN team stats JSON response (/teams/{id}/statistics)
             team_id: Team ID
+            team_info_data: Optional ESPN team info response (/teams/{id})
+                containing record, point differential, and home/away splits.
 
         Returns:
             TeamStats object or None if parsing fails
@@ -385,31 +432,201 @@ class ESPNParser:
                 except (ValueError, IndexError):
                     pass
 
+            # Use 0.0 default to detect when ESPN doesn't provide ratings
+            off_rating = get_stat("offensiveRating", 0.0)
+            def_rating = get_stat("defensiveRating", 0.0)
+            ppg = get_stat("avgPoints", 0.0)
+            pa = get_stat("avgPointsAllowed", 0.0)
+
+            # Merge data from /teams/{id} endpoint if available
+            record_data: dict[str, Any] = {}
+            if team_info_data:
+                record_data = ESPNParser._parse_team_info_record(team_info_data)
+                # Fill in points allowed from team info if not in statistics
+                if pa <= 0 and record_data.get("pa", 0) > 0:
+                    pa = record_data["pa"]
+                # Fill in PPG from team info if not in statistics
+                if ppg <= 0 and record_data.get("ppg", 0) > 0:
+                    ppg = record_data["ppg"]
+                # Use record from team info if not parsed from recordSummary
+                if wins == 0 and losses == 0:
+                    wins = record_data.get("wins", 0)
+                    losses = record_data.get("losses", 0)
+
+            # Derive net_rating: prefer per-100-possession ratings, fall back to point differential
+            if off_rating > 0 and def_rating > 0:
+                net_rating = off_rating - def_rating
+            elif record_data.get("differential") is not None and record_data.get("differential") != 0:
+                # Use pre-computed differential from team info endpoint
+                net_rating = record_data["differential"]
+            elif ppg > 0 and pa > 0:
+                net_rating = ppg - pa
+            else:
+                net_rating = 0.0  # Truly no data available
+
+            # Home/away splits from team info
+            home_wins = record_data.get("home_wins", 0)
+            home_losses = record_data.get("home_losses", 0)
+            away_wins = record_data.get("away_wins", 0)
+            away_losses = record_data.get("away_losses", 0)
+
+            # Streak from team info
+            current_streak = record_data.get("streak", 0)
+
+            # Win percentage: prefer team info (more reliable), fall back to stats
+            win_pct = record_data.get("win_pct", 0.0)
+            if win_pct <= 0:
+                win_pct = get_stat("winPercent")
+            if win_pct <= 0 and (wins + losses) > 0:
+                win_pct = wins / (wins + losses)
+
             return TeamStats(
                 team_id=team_id,
                 team_name=team_info.get("displayName", ""),
                 team_abbreviation=team_info.get("abbreviation", ""),
                 wins=wins,
                 losses=losses,
-                win_percentage=get_stat("winPercent"),
-                points_per_game=get_stat("avgPoints"),
-                offensive_rating=get_stat("offensiveRating", 110.0),
-                defensive_rating=get_stat("defensiveRating", 110.0),
+                win_percentage=win_pct,
+                points_per_game=ppg,
+                offensive_rating=off_rating if off_rating > 0 else ppg if ppg > 0 else 110.0,
+                defensive_rating=def_rating if def_rating > 0 else pa if pa > 0 else 110.0,
                 field_goal_percentage=get_stat("fieldGoalPct"),
                 three_point_percentage=get_stat("threePointFieldGoalPct"),
                 free_throw_percentage=get_stat("freeThrowPct"),
                 assists_per_game=get_stat("avgAssists"),
                 turnovers_per_game=get_stat("avgTurnovers"),
-                points_allowed_per_game=get_stat("avgPointsAllowed"),
+                points_allowed_per_game=pa,
                 steals_per_game=get_stat("avgSteals"),
                 blocks_per_game=get_stat("avgBlocks"),
-                net_rating=get_stat("offensiveRating", 110) - get_stat("defensiveRating", 110),
+                net_rating=net_rating,
                 pace=get_stat("pace", 100.0),
+                home_wins=home_wins,
+                home_losses=home_losses,
+                away_wins=away_wins,
+                away_losses=away_losses,
+                current_streak=current_streak,
             )
 
         except Exception as e:
             logger.error(f"Failed to parse team stats: {e}")
             return None
+
+    # ESPN status normalization map
+    _STATUS_MAP: dict[str, str] = {
+        "out": "out",
+        "injury_status_out": "out",
+        "o": "out",
+        "doubtful": "doubtful",
+        "d": "doubtful",
+        "questionable": "questionable",
+        "q": "questionable",
+        "day-to-day": "day-to-day",
+        "day to day": "day-to-day",
+        "dd": "day-to-day",
+        "probable": "probable",
+        "p": "probable",
+    }
+
+    # Fantasy status abbreviation map (separate from main statuses)
+    _FANTASY_STATUS_MAP: dict[str, str] = {
+        "OUT": "out",
+        "OFS": "out",
+        "GTD": "game-time decision",
+    }
+
+    @staticmethod
+    def parse_injuries(data: dict[str, Any]) -> dict[str, list[PlayerInjury]]:
+        """Parse injuries response to dict of team_id -> list of PlayerInjury.
+
+        Args:
+            data: ESPN injuries JSON response
+
+        Returns:
+            Dictionary mapping team_id to list of PlayerInjury objects
+        """
+        result: dict[str, list[PlayerInjury]] = {}
+
+        for team_entry in data.get("injuries", []):
+            team_info = team_entry.get("team", {})
+            team_id = team_info.get("id", "")
+            if not team_id:
+                continue
+
+            injuries_list = team_entry.get("injuries", [])
+            for injury_data in injuries_list:
+                try:
+                    injury = ESPNParser._parse_single_injury(injury_data, team_id)
+                    if injury:
+                        result.setdefault(team_id, []).append(injury)
+                except Exception as e:
+                    logger.debug(f"Failed to parse injury entry: {e}")
+
+        return result
+
+    @staticmethod
+    def _parse_single_injury(
+        injury_data: dict[str, Any], team_id: str
+    ) -> Optional[PlayerInjury]:
+        """Parse a single injury entry.
+
+        Args:
+            injury_data: Single injury entry from ESPN API
+            team_id: Team ID this injury belongs to
+
+        Returns:
+            PlayerInjury object or None if status can't be determined
+        """
+        athlete = injury_data.get("athlete", {})
+        player_name = athlete.get("displayName", "")
+        player_id = athlete.get("id", "")
+
+        if not player_name:
+            return None
+
+        # Multi-layer status extraction with fallbacks
+        raw_status = None
+
+        # Try direct status field
+        raw_status = injury_data.get("status")
+
+        # Fallback: type.name
+        if not raw_status:
+            raw_status = injury_data.get("type", {}).get("name")
+
+        # Fallback: type.abbreviation
+        if not raw_status:
+            raw_status = injury_data.get("type", {}).get("abbreviation")
+
+        # Normalize status
+        status = None
+        if raw_status:
+            status = ESPNParser._STATUS_MAP.get(raw_status.lower())
+
+        # Fallback: fantasy status abbreviation
+        if not status:
+            fantasy_abbr = (
+                injury_data.get("fantasyStatus", {}).get("abbreviation", "")
+            )
+            if fantasy_abbr:
+                status = ESPNParser._FANTASY_STATUS_MAP.get(fantasy_abbr)
+
+        if not status:
+            return None
+
+        # Extract injury description
+        description = (
+            injury_data.get("shortComment", "")
+            or injury_data.get("details", {}).get("detail", "")
+            or ""
+        )
+
+        return PlayerInjury(
+            player_id=player_id,
+            player_name=player_name,
+            team_id=team_id,
+            status=status,
+            injury_description=description,
+        )
 
     @staticmethod
     def parse_standings(data: dict[str, Any]) -> dict[str, dict[str, int]]:

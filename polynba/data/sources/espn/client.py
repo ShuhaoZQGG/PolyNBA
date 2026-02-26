@@ -173,6 +173,20 @@ class ESPNClient:
         logger.debug(f"Fetching team stats for team_id: {team_id}")
         return await self._request(url)
 
+    async def get_team_info(self, team_id: str) -> dict[str, Any]:
+        """Get team info including record, point differential, and home/away splits.
+
+        Args:
+            team_id: ESPN team ID
+
+        Returns:
+            Team info JSON data (includes record.items with avgPointsFor/Against)
+        """
+        url = f"{self.BASE_URL}/teams/{team_id}"
+
+        logger.debug(f"Fetching team info for team_id: {team_id}")
+        return await self._request(url)
+
     async def get_team_roster(self, team_id: str) -> dict[str, Any]:
         """Get team roster.
 
@@ -185,6 +199,17 @@ class ESPNClient:
         url = f"{self.BASE_URL}/teams/{team_id}/roster"
 
         logger.debug(f"Fetching team roster for team_id: {team_id}")
+        return await self._request(url)
+
+    async def get_injuries(self) -> dict[str, Any]:
+        """Get NBA injury data for all teams.
+
+        Returns:
+            Injuries JSON data
+        """
+        url = f"{self.BASE_URL}/injuries"
+
+        logger.debug("Fetching NBA injuries")
         return await self._request(url)
 
     async def get_standings(self) -> dict[str, Any]:

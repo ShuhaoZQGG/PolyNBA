@@ -3,7 +3,7 @@
 import logging
 from typing import Optional
 
-from ...models import GameState, GameSummary, TeamStats
+from ...models import GameState, GameSummary, PlayerInjury, TeamStats
 from .client import ESPNClient, ESPNClientError
 from .parser import ESPNParser
 
@@ -88,6 +88,10 @@ class ESPNScraper:
     async def get_team_stats(self, team_id: str) -> Optional[TeamStats]:
         """Get team statistics.
 
+        Fetches both /teams/{id}/statistics (shooting, per-game stats) and
+        /teams/{id} (record, point differential, home/away splits) and merges
+        them into a single TeamStats object.
+
         Args:
             team_id: ESPN team ID
 
@@ -96,10 +100,29 @@ class ESPNScraper:
         """
         try:
             stats = await self._client.get_team_stats(team_id)
-            return self._parser.parse_team_stats(stats, team_id)
+            # Also fetch team info for point differential and home/away record
+            team_info = None
+            try:
+                team_info = await self._client.get_team_info(team_id)
+            except ESPNClientError as e:
+                logger.warning(f"Failed to get team info for {team_id}: {e}")
+            return self._parser.parse_team_stats(stats, team_id, team_info_data=team_info)
         except ESPNClientError as e:
             logger.error(f"Failed to get team stats for {team_id}: {e}")
             return None
+
+    async def get_all_injuries(self) -> dict[str, list[PlayerInjury]]:
+        """Get injury data for all NBA teams.
+
+        Returns:
+            Dictionary mapping team_id to list of PlayerInjury objects
+        """
+        try:
+            data = await self._client.get_injuries()
+            return self._parser.parse_injuries(data)
+        except ESPNClientError as e:
+            logger.error(f"Failed to get injuries: {e}")
+            return {}
 
     async def get_team_rankings(self) -> dict[str, dict[str, int]]:
         """Get team rankings from standings.

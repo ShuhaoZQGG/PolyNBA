@@ -23,7 +23,8 @@ class CacheConfig:
     # Semi-static data
     team_stats_ttl: int = 3600  # 1 hour
     standings_ttl: int = 3600  # 1 hour
-    team_context_ttl: int = 1800  # 30 minutes
+    team_context_ttl: int = 300  # 5 minutes (matches injuries TTL)
+    injuries_ttl: int = 300  # 5 minutes
 
     # Static data
     team_info_ttl: int = 86400  # 24 hours
@@ -76,6 +77,9 @@ class DataCache:
         self._team_context_cache: TTLCache = TTLCache(
             maxsize=50, ttl=self._config.team_context_ttl
         )
+        self._injuries_cache: TTLCache = TTLCache(
+            maxsize=5, ttl=self._config.injuries_ttl
+        )
 
         # Polymarket caches
         self._polymarket_markets_cache: TTLCache = TTLCache(
@@ -100,6 +104,7 @@ class DataCache:
             "team_stats": self._team_stats_cache,
             "standings": self._standings_cache,
             "team_context": self._team_context_cache,
+            "injuries": self._injuries_cache,
             "polymarket_markets": self._polymarket_markets_cache,
             "polymarket_prices": self._polymarket_prices_cache,
             "polymarket_mappings": self._polymarket_mappings_cache,
@@ -168,6 +173,7 @@ class DataCache:
             self._team_stats_cache.clear()
             self._standings_cache.clear()
             self._team_context_cache.clear()
+            self._injuries_cache.clear()
             self._polymarket_markets_cache.clear()
             self._polymarket_prices_cache.clear()
             self._polymarket_mappings_cache.clear()

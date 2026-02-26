@@ -4,7 +4,7 @@ import logging
 from enum import Enum, auto
 from typing import Optional
 
-from .models import GameState, GameSummary, TeamStats
+from .models import GameState, GameSummary, PlayerInjury, TeamStats
 from .sources.espn import ESPNScraper
 from .sources.nba import NBAScraper
 
@@ -234,6 +234,22 @@ class FailoverManager:
 
         self._record_failure(DataSource.ESPN)
         return None
+
+    async def get_all_injuries(self) -> dict[str, list[PlayerInjury]]:
+        """Get injury data for all NBA teams (ESPN only).
+
+        Returns:
+            Dictionary mapping team_id to list of PlayerInjury objects
+        """
+        try:
+            result = await self._espn.get_all_injuries()
+            if result is not None:
+                self._record_success(DataSource.ESPN)
+                return result
+        except Exception as e:
+            logger.warning(f"ESPN get_all_injuries failed: {e}")
+            self._record_failure(DataSource.ESPN)
+        return {}
 
     @property
     def health_status(self) -> dict[str, bool]:

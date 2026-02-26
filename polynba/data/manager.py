@@ -5,7 +5,7 @@ from typing import Optional
 
 from .cache import CacheConfig, DataCache, cached
 from .failover import DataSource, FailoverManager
-from .models import GameState, GameSummary, TeamContext, TeamStats
+from .models import GameState, GameSummary, PlayerInjury, TeamContext, TeamStats
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +131,31 @@ class DataManager:
             lambda: self._failover.get_team_stats(team_id),
         )
 
+    async def get_all_injuries(self) -> dict[str, list[PlayerInjury]]:
+        """Get injury data for all NBA teams.
+
+        Returns:
+            Dictionary mapping team_id to list of PlayerInjury objects
+        """
+        return await cached(
+            self._cache,
+            "injuries",
+            "all_injuries",
+            lambda: self._failover.get_all_injuries(),
+        )
+
+    async def get_team_injuries(self, team_id: str) -> list[PlayerInjury]:
+        """Get injuries for a specific team.
+
+        Args:
+            team_id: Team ID
+
+        Returns:
+            List of PlayerInjury objects for the team
+        """
+        all_injuries = await self.get_all_injuries()
+        return all_injuries.get(team_id, [])
+
     async def get_team_context(
         self, team_id: str, opponent_id: Optional[str] = None
     ) -> Optional[TeamContext]:
@@ -154,10 +179,13 @@ class DataManager:
         if not stats:
             return None
 
-        # Build context (injuries and head-to-head would need additional data sources)
+        # Fetch injuries
+        injuries = await self.get_team_injuries(team_id)
+
+        # Build context
         context = TeamContext(
             stats=stats,
-            injuries=[],  # Would need injury data source
+            injuries=injuries,
             head_to_head=None,  # Would need head-to-head data source
         )
 
