@@ -1,0 +1,80 @@
+metadata:
+  name: "Aggressive Fast Profit-Taking"
+  description: "Fast-paced variant of aggressive strategy with lower profit targets and tighter risk controls"
+  risk_level: "high"
+  enabled: true
+
+factor_weights:
+  market_sentiment: 0.45
+  game_context: 0.35
+  team_strength: 0.20
+
+entry_rules:
+  conditions:
+    - name: "minimum_edge"
+      type: "threshold"
+      field: "edge_percentage"
+      operator: ">="
+      value: 3.0
+
+    - name: "minimum_confidence"
+      type: "threshold"
+      field: "confidence"
+      operator: ">="
+      value: 5
+
+    - name: "time_remaining"
+      type: "threshold"
+      field: "total_seconds_remaining"
+      operator: ">="
+      value: 180  # 3 minutes
+
+    - name: "price_range_low"
+      type: "threshold"
+      field: "market_price"
+      operator: ">="
+      value: 0.15
+
+    - name: "price_range_high"
+      type: "threshold"
+      field: "market_price"
+      operator: "<="
+      value: 0.75
+
+exit_rules:
+  profit_targets:
+    - time_remaining_min: 1200  # >20 min
+      target_percentage: 8.0
+    - time_remaining_min: 600   # 10-20 min
+      target_percentage: 5.0
+    - time_remaining_min: 300   # 5-10 min
+      target_percentage: 3.0
+    - time_remaining_min: 0     # <5 min (end-of-game micro-profits)
+      target_percentage: 2.0
+
+  stop_loss:
+    value: 15.0  # Base stop-loss; dynamically widened for low-price positions (< 0.35)
+    late_game_widening:
+      - time_remaining_max: 720   # <= 12 min: 1.5x → 22.5%
+        multiplier: 1.5
+      - time_remaining_max: 300   # <= 5 min: 2.0x → 30%
+        multiplier: 2.0
+
+  time_stop:
+    exit_before_seconds: 30
+
+position_sizing:
+  method: "kelly_fraction"
+  kelly_multiplier: 0.40
+  max_position_usdc: 250
+  min_position_usdc: 5
+  late_game_seconds: 720   # Scale down when <= 12 min remaining (Q4)
+  late_game_multiplier: 0.50  # Half-size positions in late game
+
+risk_limits:
+  max_concurrent_positions: 5
+  max_daily_loss_usdc: 300
+  max_position_per_game: 2
+  cooldown_iterations: 10
+  max_stop_losses_per_game: 2
+  max_loss_per_game_usdc: 15

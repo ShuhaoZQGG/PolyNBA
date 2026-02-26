@@ -39,20 +39,28 @@ polynba --mode paper
 ```
 
 ## Test game (simulation)
-To test the bot without a real NBA game or Polymarket API, use **test game mode**. It runs a single mock game with a time series of randomly generated bid/ask prices so you can exercise the full loop (edge detection, strategies, paper orders) locally.
+To test the bot without a real NBA game or Polymarket API, use **test game mode**. It runs a scenario-driven mock game with time-series prices so you can exercise the full loop (edge detection, strategies, paper orders) locally. The game ends naturally and the bot stops automatically.
 
 ```bash
 python -m polynba --test-game
 ```
 
-Defaults: 20 price ticks, 5-second loop interval, and the bot stops after 20 iterations. Optional:
+Optional flags:
 
-- **`--test-game-ticks N`** – Number of price ticks (and game-state steps). Each loop iteration consumes the next tick.
-- **`--max-iterations N`** – Override how many iterations to run (e.g. `--max-iterations 10`).
+- **`--test-game-scenario NAME`** – Choose a game scenario. Available: `home_blowout`, `away_blowout`, `close_game`, `home_comeback`, `away_comeback`, `failed_comeback`, `overtime_thriller`, `wire_to_wire`, `late_collapse`, `back_and_forth`, or `random` (default).
+- **`--test-game-ticks N`** – Number of price ticks for the simulated market.
+- **`--max-iterations N`** – Override how many iterations to run.
 
-Example: short run with 3 ticks and no Claude:
+Examples:
 
 ```bash
+# Run a home blowout scenario
+python -m polynba --test-game --test-game-scenario home_blowout
+
+# Run a random scenario with no Claude
+python -m polynba --test-game --no-claude
+
+# Short run with 3 ticks
 python -m polynba --test-game --test-game-ticks 3 --max-iterations 3 --no-claude
 ```
 
@@ -67,6 +75,7 @@ In test game mode the bot skips Polymarket verification and game selection; it u
 --interval INT              Loop interval in seconds
 --max-iterations INT        Stop after N iterations
 --test-game                 Mock game + time-series prices (no real API)
+--test-game-scenario NAME   Game scenario (e.g. home_blowout, random)
 --test-game-ticks N         Number of price ticks for --test-game (default: 20)
 --no-claude                 Disable Claude analysis
 --log-level LEVEL           DEBUG|INFO|WARNING|ERROR

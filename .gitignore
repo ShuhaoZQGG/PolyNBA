@@ -55,3 +55,5 @@ performance.json
 # OS
 .DS_Store
 Thumbs.db
+batch_results_*/
+replay_results_*/

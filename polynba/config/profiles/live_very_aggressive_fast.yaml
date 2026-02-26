@@ -1,0 +1,90 @@
+# Profile: live + aggressive_fast + high exposure
+mode: "live"
+bankroll: 1000.0
+active_strategies:
+  - "very_aggressive_fast"
+
+loop:
+  interval_seconds: 30
+  max_iterations: null
+
+data:
+  primary_source: "espn"
+  cache:
+    live_game_ttl: 15
+    scoreboard_ttl: 30
+    team_stats_ttl: 3600
+
+apis:
+  claude:
+    model: "claude-haiku-4-5-20251001"
+    daily_budget_usd: 10.0
+    min_interval_seconds: 120
+    enabled: true
+  polymarket:
+    host: "https://clob.polymarket.com"
+    gamma_api: "https://gamma-api.polymarket.com"
+    rpc_url: "https://polygon-rpc.com"
+    chain_id: 137
+    websocket_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    discovery:
+      cache_ttl_seconds: 300
+    prices:
+      poll_interval_seconds: 15
+      fallback_to_simulated: false
+      min_liquidity_usdc: 100
+
+edge:
+  min_edge_percent: 3.0
+  max_edge_percent: 50.0
+  min_confidence: 5
+  min_market_price: 0.10
+  max_market_price: 0.90
+  min_time_remaining_seconds: 300
+  exclude_overtime: false
+
+exit:
+  stop_loss_percent: null
+  exit_before_seconds: null
+  profit_target_percent: null
+
+risk:
+  max_position_usdc: 200
+  max_total_exposure_usdc: 800
+  max_daily_loss_usdc: 150
+  max_concurrent_positions: 5
+  max_position_per_market: 1
+  min_order_size_usdc: 3
+  max_order_size_usdc: 75
+  min_position_usdc: null
+
+allocation:
+  max_portfolio_exposure: 0.55
+  low_risk_percent: 0.50
+  medium_risk_percent: 0.35
+  high_risk_percent: 0.15
+
+trading:
+  conflict_min_confidence: 7
+
+position_sizing:
+  kelly_multiplier_override: null
+
+logging:
+  level: "INFO"
+  file: "polynba.log"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+performance:
+  track_trades: true
+  save_interval_minutes: 15
+  report_file: "performance.json"
+
+portfolio_display:
+  interval: 1
+  compact: false
+
+command_server:
+  enabled: true
+  host: "127.0.0.1"
+  port: 8765

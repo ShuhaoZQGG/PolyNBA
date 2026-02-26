@@ -1,0 +1,108 @@
+# ============================================================================
+# Recommended #4: Balanced Scalper
+# ============================================================================
+# Source: Grid search over 972 configs, replayed on 5 live games from 2026-02-24
+# Rank: #7 by total PnL (tied #7/#8)
+#
+# Backtested Stats (2026-02-24, 5 games, bankroll=$500):
+#   Total PnL:   +$34.53
+#   Trades:      23 round-trips
+#   Win/Loss:    20W / 3L
+#   Win Rate:    87.0%
+#
+#   Per-Game Breakdown:
+#     DAL @ BKN:  +$12.32  (DAL won 123-114)
+#     OKC @ TOR:  +$22.67  (OKC won 110-101)
+#     NY  @ CLE:  +$ 3.39  (CLE won 98-78)
+#     PHI @ IND:  -$ 3.86  (PHI won 131-110)
+#     WSH @ ATL:  +$ 0.00  (no trades triggered, blowout)
+#
+# Key Characteristics:
+#   - Balanced middle-ground between rec1 (aggressive) and rec5 (safe)
+#   - 1.5% edge captures more signals than 2% without going as wide as 1%
+#   - 3% profit target: slightly more patient than 2%, better per-trade returns
+#   - Only 3 losing trades out of 23 (87% WR)
+#   - PHI@IND was the only losing game; all others strongly positive
+#
+# vs Live Session (very_aggressive_fast, edge=3%, kelly=0.4x):
+#   Live PnL: -$0.08 | This config: +$34.53 | Improvement: +$34.61
+# ============================================================================
+
+metadata:
+  name: "Recommended #4: Balanced Scalper"
+  description: "Balanced edge/PT config from 20260224 grid search. Edge=1.5%, SL=20%, PT=3%, Kelly=0.6x. 23 trades, 87% WR, +$34.53."
+  risk_level: "high"
+  enabled: true
+
+factor_weights:
+  market_sentiment: 0.45
+  game_context: 0.35
+  team_strength: 0.20
+
+entry_rules:
+  conditions:
+    - name: "minimum_edge"
+      type: "threshold"
+      field: "edge_percentage"
+      operator: ">="
+      value: 1.5
+
+    - name: "minimum_confidence"
+      type: "threshold"
+      field: "confidence"
+      operator: ">="
+      value: 5
+
+    - name: "time_remaining"
+      type: "threshold"
+      field: "total_seconds_remaining"
+      operator: ">="
+      value: 180
+
+    - name: "price_range_low"
+      type: "threshold"
+      field: "market_price"
+      operator: ">="
+      value: 0.15
+
+    - name: "price_range_high"
+      type: "threshold"
+      field: "market_price"
+      operator: "<="
+      value: 0.75
+
+exit_rules:
+  profit_targets:
+    - time_remaining_min: 1200
+      target_percentage: 3.0
+    - time_remaining_min: 600
+      target_percentage: 3.0
+    - time_remaining_min: 300
+      target_percentage: 3.0
+    - time_remaining_min: 0
+      target_percentage: 3.0
+
+  stop_loss:
+    value: 20.0
+    late_game_widening:
+      - time_remaining_max: 600
+        multiplier: 1.3
+      - time_remaining_max: 300
+        multiplier: 1.5
+
+  time_stop:
+    exit_before_seconds: 30
+
+position_sizing:
+  method: "kelly_fraction"
+  kelly_multiplier: 0.60
+  max_position_usdc: 250
+  min_position_usdc: 10
+
+risk_limits:
+  max_concurrent_positions: 5
+  max_daily_loss_usdc: 300
+  max_position_per_game: 2
+  cooldown_iterations: 10
+  max_stop_losses_per_game: 2
+  max_loss_per_game_usdc: 15
