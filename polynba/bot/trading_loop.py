@@ -1,10 +1,12 @@
 """Main trading loop orchestration."""
 
 import asyncio
+import hashlib
 import logging
 import math
 import os
 import random
+import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
@@ -20,6 +22,7 @@ from ..analysis import (
     ProbabilityCalculator,
 )
 from ..data import DataManager, GameState, TeamStats
+from ..data.models import GameStatus, TeamContext, TradeSide
 from ..polymarket import (
     MarketDiscovery,
     MarketMapper,
@@ -29,8 +32,9 @@ from ..polymarket import (
 )
 from ..testing import TestDataManager, TestMarketMapper
 from ..testing.mock_mapper import TEST_CONDITION_ID
-from ..strategy import CapitalAllocation, StrategyManager, TradingSignal
+from ..strategy import CapitalAllocation, ExitSignal, StrategyManager, TradingSignal
 from ..trading import (
+    DelayConfig,
     MarketData,
     OrderManager,
     PaperTradingExecutor,
@@ -88,6 +92,7 @@ class BotConfig:
     # Test game (mock time-series prices, no real API)
     test_game: bool = False
     test_game_ticks: Optional[int] = None  # Number of price ticks / game states (default 20)
+    test_game_scenario: Optional[str] = None  # Scenario name (e.g. "home_blowout", "random")
 
     # Polymarket settings
     polymarket_gamma_api: str = "https://gamma-api.polymarket.com"
@@ -103,6 +108,11 @@ class BotConfig:
     max_market_price: float = 0.90
     min_time_remaining_seconds: int = 300
     exclude_overtime: bool = False
+
+    # Volatility filter: raise min_edge when game is tight + late
+    volatility_score_threshold: int = 5
+    volatility_period_threshold: int = 3
+    volatility_edge_multiplier: float = 1.5
 
     # Exit overrides (sell; None = use strategy YAML)
     exit_stop_loss_percent: Optional[float] = None
@@ -180,6 +190,10 @@ class BotConfig:
             max_market_price=float(data.get("edge", {}).get("max_market_price", 0.90)),
             min_time_remaining_seconds=int(data.get("edge", {}).get("min_time_remaining_seconds", 300)),
             exclude_overtime=bool(data.get("edge", {}).get("exclude_overtime", False)),
+            # Volatility filter
+            volatility_score_threshold=int(data.get("edge", {}).get("volatility", {}).get("score_threshold", 5)),
+            volatility_period_threshold=int(data.get("edge", {}).get("volatility", {}).get("period_threshold", 3)),
+            volatility_edge_multiplier=float(data.get("edge", {}).get("volatility", {}).get("edge_multiplier", 1.5)),
             # Exit overrides (None = use strategy)
             exit_stop_loss_percent=_optional_float(data.get("exit", {}).get("stop_loss_percent")),
             exit_before_seconds=_optional_int(data.get("exit", {}).get("exit_before_seconds")),
@@ -211,11 +225,15 @@ class BotConfig:
 class TradingBot:
     """Main trading bot orchestrator."""
 
+    AI_ANALYSIS_MIN_INTERVAL = 180  # Minimum seconds between AI analyses per game
+
     def __init__(
         self,
         config: BotConfig,
         executor: Optional[TradingExecutor] = None,
         data_manager: Optional[DataManager] = None,
+        log_dir: Optional[Path] = None,
+        start_ts: str = "",
     ):
         """Initialize trading bot.
 
@@ -223,14 +241,21 @@ class TradingBot:
             config: Bot configuration
             executor: Trading executor (paper or live)
             data_manager: Data manager instance
+            log_dir: Log directory path for this session
+            start_ts: Timestamp string used in the log directory name
         """
         self._config = config
         self._running = False
+        self._log_dir = log_dir
+        self._start_ts = start_ts
+        self._game_identity: Optional[tuple[str, str]] = None
 
         # Core components (or test-game mocks)
         if config.test_game:
             n_ticks = config.test_game_ticks or 20
-            self._data_manager = TestDataManager(n_game_states=n_ticks)
+            self._data_manager = TestDataManager(
+                n_game_states=n_ticks, scenario=config.test_game_scenario
+            )
             self._market_mapper = TestMarketMapper()
             self._price_fetcher = TimeSeriesPriceFetcher(
                 prices=generate_random_price_series(
@@ -287,8 +312,16 @@ class TradingBot:
             limits=risk_limits,
             position_tracker=self._position_tracker,
         )
+        # In test-game mode, disable the price-deviation auto-cancel because
+        # simulated prices jump much faster than real markets.
+        delay_cfg = (
+            DelayConfig(enable_auto_cancel=False)
+            if config.test_game
+            else None
+        )
         self._order_manager = OrderManager(
             executor=self._executor,
+            config=delay_cfg,
             on_fill=self._on_order_fill,
             on_cancel=self._on_order_cancel,
         )
@@ -324,6 +357,9 @@ class TradingBot:
                 max_market_price=Decimal(str(config.max_market_price)),
                 min_time_remaining_seconds=config.min_time_remaining_seconds,
                 exclude_overtime=config.exclude_overtime,
+                volatility_score_threshold=config.volatility_score_threshold,
+                volatility_period_threshold=config.volatility_period_threshold,
+                volatility_edge_multiplier=config.volatility_edge_multiplier,
             )
         )
         self._context_builder = ContextBuilder()
@@ -360,6 +396,13 @@ class TradingBot:
         self._active_games: dict[str, GameState] = {}
         self._token_id_to_game_id: dict[str, str] = {}
         self._command_server: Optional[asyncio.AbstractServer] = None
+        self._ai_analysis_log: list[dict] = []
+        self._last_live_balance: Optional[Decimal] = None
+
+        # AI analysis deduplication and rate limiting
+        self._last_analyzed_state: dict[str, str] = {}  # game_id -> state hash
+        self._last_ai_call_time: dict[str, float] = {}  # game_id -> timestamp
+        self._last_analyzed_score: dict[str, tuple[int, int]] = {}  # game_id -> (home, away)
 
     async def start(self) -> None:
         """Start the trading bot."""
@@ -375,10 +418,15 @@ class TradingBot:
             try:
                 balance = await self._executor.get_balance()
                 if balance.usdc > 0:
+                    self._config.bankroll = float(balance.usdc)
                     self._portfolio_display._initial_balance = balance.usdc
                     self._performance._initial_equity = float(balance.usdc)
+                    self._performance._current_equity = float(balance.usdc)
+                    self._performance._peak_equity = float(balance.usdc)
+                    self._last_live_balance = balance.usdc
                     self._strategy_manager.update_bankroll(balance.usdc)
                     logger.info(f"Live balance: ${balance.usdc:.2f} USDC")
+                    print(f"\n  Live bankroll: ${balance.usdc:.2f} USDC (from wallet)\n")
             except Exception as e:
                 logger.warning(f"Could not fetch live balance: {e}")
 
@@ -449,6 +497,10 @@ class TradingBot:
     async def stop(self) -> None:
         """Stop the trading bot."""
         logger.info("Stopping PolyNBA bot")
+
+        # Generate summary before cleanup so all data is still available
+        self._write_summary()
+
         self._running = False
 
         await self._stop_command_server()
@@ -460,6 +512,237 @@ class TradingBot:
         self._performance.save()
 
         logger.info("Bot stopped")
+
+    def _generate_session_summary(self) -> str:
+        """Generate a text summary of the trading session."""
+        from datetime import datetime
+
+        lines: list[str] = []
+        now = datetime.now()
+        session_start = self._portfolio_display.session_start
+        duration = now - session_start
+
+        hours, remainder = divmod(int(duration.total_seconds()), 3600)
+        minutes, seconds = divmod(remainder, 60)
+
+        # --- Session Info ---
+        lines.append("=" * 60)
+        lines.append("  PolyNBA Session Summary")
+        lines.append("=" * 60)
+        lines.append("")
+        lines.append("SESSION INFO")
+        lines.append(f"  Mode:           {self._config.mode}")
+        lines.append(f"  Start:          {session_start.strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"  End:            {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"  Duration:       {hours}h {minutes}m {seconds}s")
+        lines.append(f"  Iterations:     {self._iteration}")
+        lines.append(f"  Bankroll:       ${self._config.bankroll:.2f}")
+        lines.append("")
+
+        # --- Game ---
+        lines.append("GAME")
+        if self._game_identity:
+            away, home = self._game_identity
+            lines.append(f"  Matchup:        {away} @ {home}")
+        else:
+            lines.append("  No game was processed during this session.")
+
+        # Last known score from active games
+        for gid, gs in self._active_games.items():
+            away_abbr = gs.away_team.team_abbreviation
+            home_abbr = gs.home_team.team_abbreviation
+            lines.append(
+                f"  Last score:     {away_abbr} {gs.away_team.score} - "
+                f"{home_abbr} {gs.home_team.score}  "
+                f"({gs.period.display_name} {gs.clock})"
+            )
+        lines.append("")
+
+        # --- Strategies ---
+        lines.append("STRATEGIES")
+        for sid in self._strategy_manager.active_strategies:
+            strategy = self._strategy_manager.get_strategy(sid)
+            stats = self._strategy_manager.get_strategy_stats(sid)
+
+            desc = ""
+            if strategy and strategy.metadata:
+                desc = f" - {strategy.metadata.description}" if strategy.metadata.description else ""
+
+            lines.append(f"  [{sid}]{desc}")
+            lines.append(
+                f"    Signals: {stats.get('signals_generated', 0)}  "
+                f"Trades: {stats.get('trades_executed', 0)}  "
+                f"W/L: {stats.get('wins', 0)}/{stats.get('losses', 0)}  "
+                f"PnL: ${float(stats.get('total_pnl', 0)):.2f}"
+            )
+        lines.append("")
+
+        # --- Trade Log ---
+        trades = self._position_tracker.get_trades(limit=9999)
+        lines.append("TRADE LOG")
+        if trades:
+            lines.append(f"  {'Time':<20} {'Side':<5} {'Size':>10} {'Price':>8} {'Strategy':<16}")
+            lines.append(f"  {'-'*20} {'-'*5} {'-'*10} {'-'*8} {'-'*16}")
+            for t in trades:
+                ts = t.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+                side_str = t.side.value if hasattr(t.side, 'value') else str(t.side)
+                lines.append(
+                    f"  {ts:<20} {side_str:<5} "
+                    f"${float(t.size * t.price):>9.2f} "
+                    f"{float(t.price):>7.4f} "
+                    f"{t.strategy_id or 'N/A':<16}"
+                )
+        else:
+            lines.append("  No trades executed.")
+        lines.append("")
+
+        # --- Open Positions at Shutdown ---
+        positions = self._position_tracker.get_all_positions()
+        lines.append("OPEN POSITIONS AT SHUTDOWN")
+        if positions:
+            for p in positions:
+                side_str = p.side.value if hasattr(p.side, 'value') else str(p.side)
+                lines.append(
+                    f"  {side_str} {float(p.size):.4f} @ {float(p.avg_entry_price):.4f}  "
+                    f"cost=${float(p.total_cost):.2f}  strategy={p.strategy_id or 'N/A'}"
+                )
+        else:
+            lines.append("  No open positions.")
+        lines.append("")
+
+        # --- Performance ---
+        lines.append("PERFORMANCE")
+        perf = self._performance.get_summary()
+        pos_stats = self._position_tracker.stats
+        realized_pnl = float(self._position_tracker.total_realized_pnl())
+        completed = pos_stats.get("completed_trades", 0)
+        wins = pos_stats.get("winning_trades", 0)
+        losses = pos_stats.get("losing_trades", 0)
+        win_rate = wins / completed if completed > 0 else 0.0
+
+        lines.append(f"  Initial equity:   ${perf.get('initial_equity', 0):.2f}")
+        lines.append(f"  Current equity:   ${perf.get('current_equity', 0):.2f}")
+        lines.append(f"  Total PnL:        ${perf.get('total_pnl', 0):.2f}")
+        lines.append(f"  Return:           {perf.get('total_return_percent', 0):.2f}%")
+        lines.append(f"  Realized PnL:     ${realized_pnl:.2f}")
+        lines.append(f"  Total trades:     {completed}")
+        lines.append(f"  Win rate:         {win_rate:.1%}")
+        lines.append(f"  Max drawdown:     {perf.get('max_drawdown_percent', 0):.2f}%")
+        lines.append("")
+
+        # --- AI Analysis Log ---
+        if self._claude_analyzer:
+            if self._ai_analysis_log:
+                n = len(self._ai_analysis_log)
+                lines.append(f"AI ANALYSIS LOG ({n} {'analysis' if n == 1 else 'analyses'})")
+                for idx, entry in enumerate(self._ai_analysis_log, 1):
+                    ts = entry["timestamp"].strftime("%H:%M:%S")
+                    edge_str = f"{entry['edge_pct']:+.1f}%"
+                    lines.append(
+                        f"  #{idx} [Iter {entry['iteration']}] {ts} | "
+                        f"{entry['score']} ({entry['period']}) | Edge: {edge_str}"
+                    )
+                    lines.append(
+                        f"     Assessment: {entry['assessment']} "
+                        f"(conf {entry['ai_confidence']}/10) | "
+                        f"Adj: sent={entry['sentiment_adj']:+d} ctx={entry['context_adj']:+d}"
+                    )
+                    factors = ", ".join(entry["key_factors"]) if entry["key_factors"] else "none"
+                    lines.append(f"     Factors: {factors}")
+                    lines.append(f"     Reasoning: {entry['reasoning']}")
+                    # Outcome line
+                    opps = entry.get("opportunities", 0)
+                    sigs = entry.get("signals", 0)
+                    if sigs > 0:
+                        outcome = f"{opps} edge found, {sigs} signal(s) executed"
+                    elif opps > 0:
+                        outcome = f"{opps} edge found, 0 signals"
+                    else:
+                        outcome = "no edge found"
+                    lines.append(f"     Outcome: {outcome}")
+                    lines.append("")
+            else:
+                lines.append("AI ANALYSIS LOG")
+                lines.append("  Claude AI was enabled but no analyses were triggered.")
+                lines.append("")
+
+            usage = self._claude_analyzer.usage_stats
+            lines.append(f"  Claude Usage: {usage.get('total_requests', 0)} requests, "
+                         f"${usage.get('total_cost_usd', 0):.4f} total cost")
+        else:
+            lines.append("AI ANALYSIS LOG")
+            lines.append("  Claude AI was not used this session.")
+        lines.append("")
+
+        # --- Final Portfolio Snapshot (ASCII box) ---
+        try:
+            from ..utils.portfolio_display import PortfolioSnapshot
+
+            # Build snapshot from data already available (no async calls)
+            pos_stats_snap = self._position_tracker.stats
+            realized = self._position_tracker.total_realized_pnl()
+            exposure = Decimal(str(pos_stats_snap.get("total_exposure", 0)))
+
+            # Best-effort balance: use cached live balance if available,
+            # otherwise fall back to paper executor's _balance or config bankroll
+            if hasattr(self, '_last_live_balance') and self._last_live_balance is not None:
+                balance_usdc = self._last_live_balance
+                available_usdc = balance_usdc - exposure
+            elif hasattr(self._executor, '_balance'):
+                balance_usdc = self._executor._balance
+                available_usdc = balance_usdc - exposure
+            else:
+                balance_usdc = Decimal(str(self._config.bankroll))
+                available_usdc = balance_usdc
+
+            snapshot = PortfolioSnapshot(
+                session_start=self._portfolio_display.session_start,
+                current_time=now,
+                iteration=self._iteration,
+                initial_balance=self._portfolio_display.initial_balance,
+                current_balance=balance_usdc,
+                available_balance=available_usdc,
+                realized_pnl=realized,
+                unrealized_pnl=Decimal("0"),
+                total_trades=pos_stats_snap.get("completed_trades", 0),
+                winning_trades=pos_stats_snap.get("winning_trades", 0),
+                losing_trades=pos_stats_snap.get("losing_trades", 0),
+                open_positions=pos_stats_snap.get("open_positions", 0),
+                pending_orders=self._order_manager.stats.get("pending_count", 0),
+                total_exposure=exposure,
+                max_drawdown_pct=perf.get("max_drawdown_percent", 0),
+                circuit_breaker_active=self._risk_manager.stats.get(
+                    "circuit_breaker_active", False
+                ),
+            )
+            lines.append(self._portfolio_display.format_summary(snapshot))
+        except Exception as e:
+            logger.debug(f"Could not build final portfolio snapshot: {e}")
+
+        lines.append("=" * 60)
+
+        return "\n".join(lines)
+
+    def _write_summary(self) -> None:
+        """Write session summary to file and print to console."""
+        try:
+            summary = self._generate_session_summary()
+        except Exception as e:
+            logger.warning(f"Failed to generate session summary: {e}")
+            return
+
+        # Print to console
+        print("\n" + summary)
+
+        # Write to file
+        if self._log_dir:
+            try:
+                self._log_dir.mkdir(parents=True, exist_ok=True)
+                summary_path = self._log_dir / "summary.txt"
+                summary_path.write_text(summary)
+                logger.info(f"Session summary written to {summary_path}")
+            except Exception as e:
+                logger.warning(f"Failed to write summary file: {e}")
 
     async def _start_command_server(self) -> None:
         """Start the command server for interactive commands."""
@@ -526,8 +809,14 @@ class TradingBot:
         live_games = await self._data_manager.get_live_games()
 
         if not live_games:
+            self._no_game_count = getattr(self, '_no_game_count', 0) + 1
+            if self._config.test_game and self._no_game_count >= 3:
+                logger.info("Test game ended. Stopping bot.")
+                self._running = False
+                return
             logger.info("No live games")
             return
+        self._no_game_count = 0
 
         if self._config.allowed_game_ids is not None:
             live_games = [
@@ -551,6 +840,12 @@ class TradingBot:
 
         # 4. Take performance snapshot
         balance = await self._executor.get_balance()
+        self._last_live_balance = balance.usdc
+        # Sync performance tracker equity with real wallet balance in live mode
+        if self._config.mode == "live":
+            self._performance._current_equity = float(balance.usdc)
+            if float(balance.usdc) > self._performance._peak_equity:
+                self._performance._peak_equity = float(balance.usdc)
         positions = self._position_tracker.get_all_positions()
         orders = self._order_manager.get_all_open_orders()
 
@@ -563,6 +858,53 @@ class TradingBot:
 
         # 5. Display portfolio summary
         await self._print_portfolio_summary()
+
+    def _should_run_ai_analysis(self, game_id: str, game_state: GameState) -> bool:
+        """Check whether AI analysis should run for the given game state.
+
+        Returns False (skip) when:
+        - The game is at halftime or end-of-period
+        - The game state (score/period/clock) is unchanged since last analysis
+        - Not enough time has elapsed AND the score hasn't jumped by >= 3 points
+        """
+        # Check 1: Skip during halftime or end-of-period breaks
+        if game_state.status in {GameStatus.HALFTIME, GameStatus.END_OF_PERIOD}:
+            logger.debug(f"  AI analysis skipped for {game_id}: {game_state.status.value}")
+            return False
+
+        # Check 2: Has game state changed since last analysis?
+        state_hash = hashlib.md5(
+            f"{game_state.home_team.score}:{game_state.away_team.score}"
+            f":{game_state.period.value}:{game_state.clock}".encode()
+        ).hexdigest()
+        if self._last_analyzed_state.get(game_id) == state_hash:
+            logger.debug(f"  AI analysis skipped for {game_id}: game state unchanged")
+            return False
+
+        # Check 3: Rate limiting — require minimum interval, unless score jumped >= 3
+        last_call = self._last_ai_call_time.get(game_id, 0.0)
+        elapsed = time.time() - last_call
+        if elapsed < self.AI_ANALYSIS_MIN_INTERVAL:
+            last_score = self._last_analyzed_score.get(game_id, (0, 0))
+            score_delta = abs(game_state.home_team.score - last_score[0]) + abs(
+                game_state.away_team.score - last_score[1]
+            )
+            if score_delta < 3:
+                logger.debug(
+                    f"  AI analysis skipped for {game_id}: rate limited "
+                    f"({elapsed:.0f}s < {self.AI_ANALYSIS_MIN_INTERVAL}s, "
+                    f"score delta={score_delta})"
+                )
+                return False
+
+        # All checks passed — update tracking state
+        self._last_analyzed_state[game_id] = state_hash
+        self._last_ai_call_time[game_id] = time.time()
+        self._last_analyzed_score[game_id] = (
+            game_state.home_team.score,
+            game_state.away_team.score,
+        )
+        return True
 
     async def _process_game(self, game_id: str) -> None:
         """Process a single game for trading opportunities."""
@@ -578,6 +920,13 @@ class TradingBot:
             return
 
         self._active_games[game_id] = game_state
+
+        # One-time game identity capture for log directory naming
+        if self._game_identity is None:
+            away_abbr = game_state.away_team.team_abbreviation
+            home_abbr = game_state.home_team.team_abbreviation
+            self._game_identity = (away_abbr, home_abbr)
+            self._rename_log_dir(away_abbr, home_abbr)
 
         # Log game info
         logger.info(
@@ -599,12 +948,33 @@ class TradingBot:
             logger.warning(f"Missing team stats for game {game_id}")
             return
 
+        # Fetch team contexts (includes injuries)
+        home_context = await self._data_manager.get_team_context(
+            game_state.home_team.team_id, game_state.away_team.team_id
+        )
+        away_context = await self._data_manager.get_team_context(
+            game_state.away_team.team_id, game_state.home_team.team_id
+        )
+
+        home_abbr = game_state.home_team.team_abbreviation
+        away_abbr = game_state.away_team.team_abbreviation
+
         logger.info(
-            f"  Records: {game_state.home_team.team_abbreviation} "
+            f"  Records: {home_abbr} "
             f"({home_stats.wins}-{home_stats.losses}) vs "
-            f"{game_state.away_team.team_abbreviation} "
+            f"{away_abbr} "
             f"({away_stats.wins}-{away_stats.losses})"
         )
+
+        if home_context and home_context.key_players_out:
+            logger.info(f"  {home_abbr} injuries: {', '.join(i.player_name for i in home_context.key_players_out)}")
+        if away_context and away_context.key_players_out:
+            logger.info(f"  {away_abbr} injuries: {', '.join(i.player_name for i in away_context.key_players_out)}")
+
+        # Skip new analysis and entries during halftime/breaks
+        if game_state.status in (GameStatus.HALFTIME, GameStatus.END_OF_PERIOD):
+            logger.info(f"  Game is at {game_state.status.value}, skipping analysis and entries")
+            return
 
         # Get market data (in real impl, would fetch from Polymarket)
         market_data = await self._get_market_data(game_id, game_state)
@@ -623,6 +993,8 @@ class TradingBot:
             home_market_price=home_market_price,
             home_stats=home_stats,
             away_stats=away_stats,
+            home_context=home_context,
+            away_context=away_context,
             away_market_price=away_market_price,
         )
 
@@ -644,9 +1016,13 @@ class TradingBot:
 
         # Optionally enhance with Claude analysis
         if self._claude_analyzer and abs(estimate.edge_percentage) >= self._config.min_edge_percent:
-            await self._enhance_with_claude(
-                game_state, home_market_price, estimate, home_stats, away_stats
-            )
+            if self._should_run_ai_analysis(game_id, game_state):
+                await self._enhance_with_claude(
+                    game_state, home_market_price, estimate, home_stats, away_stats,
+                    home_context=home_context, away_context=away_context,
+                )
+            else:
+                logger.debug(f"  AI analysis skipped for {game_id}")
 
         # Detect edge opportunities
         opportunities = self._edge_detector.detect(
@@ -668,9 +1044,16 @@ class TradingBot:
             elif filt.exclude_overtime and game_state.period.is_overtime:
                 logger.info("  Filtered: overtime excluded")
             else:
-                logger.info(
-                    f"  No edge opportunity (need >= {filt.min_edge_percent}% edge)"
-                )
+                effective = self._edge_detector._effective_min_edge(game_state)
+                if effective > filt.min_edge_percent:
+                    logger.info(
+                        f"  No edge opportunity (need >= {effective:.2f}% edge, "
+                        f"raised from {filt.min_edge_percent}% by volatility filter)"
+                    )
+                else:
+                    logger.info(
+                        f"  No edge opportunity (need >= {filt.min_edge_percent}% edge)"
+                    )
         else:
             for opportunity in opportunities:
                 logger.info(
@@ -681,6 +1064,7 @@ class TradingBot:
                 )
 
         # Evaluate against strategies
+        signals_count = 0
         for opportunity in opportunities:
             signals = self._strategy_manager.evaluate_opportunity(
                 game_state, opportunity
@@ -692,12 +1076,62 @@ class TradingBot:
                 )
 
             for signal in signals:
+                # Enforce position accumulation limit: skip buy if we
+                # already hold a position on this token.
+                if signal.action == "buy":
+                    existing = self._position_tracker.get_position(signal.token_id)
+                    if existing and existing.size > 0:
+                        logger.info(
+                            f"  Skipping buy: already have open position on "
+                            f"{signal.token_id[:16]}... "
+                            f"(size={float(existing.size):.4f}, "
+                            f"cost=${float(existing.total_cost):.2f})"
+                        )
+                        continue
+
+                signals_count += 1
                 logger.info(
                     f"  >>> SIGNAL: {signal.strategy_id} | "
                     f"{signal.action.upper()} {signal.side} | "
                     f"Size: ${float(signal.size):.2f} @ {float(signal.price):.4f}"
                 )
                 await self._execute_signal(signal)
+
+        # Attach outcome to the AI analysis log entry for this iteration
+        if (self._ai_analysis_log
+                and self._ai_analysis_log[-1]["iteration"] == self._iteration):
+            self._ai_analysis_log[-1]["opportunities"] = len(opportunities)
+            self._ai_analysis_log[-1]["signals"] = signals_count
+
+    def _rename_log_dir(self, away_abbr: str, home_abbr: str) -> None:
+        """Rename the log directory to include team abbreviations.
+
+        Renames from ``{timestamp}/`` to ``{timestamp}_{away}_vs_{home}/``
+        and updates the logging FileHandler to point to the new path.
+        """
+        if not self._log_dir or not self._log_dir.exists():
+            return
+
+        new_name = f"{self._start_ts}_{away_abbr}_vs_{home_abbr}"
+        new_dir = self._log_dir.parent / new_name
+
+        try:
+            self._log_dir.rename(new_dir)
+            self._log_dir = new_dir
+
+            # Update any FileHandler so logging continues at the new path
+            root_logger = logging.getLogger()
+            for handler in root_logger.handlers:
+                if isinstance(handler, logging.FileHandler):
+                    new_log_path = str(new_dir / "full.txt")
+                    handler.close()
+                    handler.baseFilename = new_log_path
+                    handler.stream = handler._open()
+                    break
+
+            logger.info(f"Log directory renamed to {new_dir}")
+        except Exception as e:
+            logger.warning(f"Could not rename log directory: {e}")
 
     async def _get_market_data(
         self, game_id: str, game_state: GameState
@@ -888,6 +1322,8 @@ class TradingBot:
         estimate,
         home_stats: TeamStats,
         away_stats: TeamStats,
+        home_context: Optional[TeamContext] = None,
+        away_context: Optional[TeamContext] = None,
     ) -> None:
         """Enhance analysis with Claude."""
         if not self._claude_analyzer:
@@ -899,6 +1335,8 @@ class TradingBot:
             estimate=estimate,
             home_stats=home_stats,
             away_stats=away_stats,
+            home_context=home_context,
+            away_context=away_context,
         )
 
         analysis = await self._claude_analyzer.analyze(
@@ -911,17 +1349,50 @@ class TradingBot:
         if analysis:
             logger.info(
                 f"Claude analysis for {game_state.game_id}: "
-                f"{analysis.market_assessment} (conf: {analysis.confidence})"
+                f"assessment={analysis.market_assessment} conf={analysis.confidence} "
+                f"sentiment_adj={analysis.sentiment_adjustment} "
+                f"context_adj={analysis.context_adjustment}"
             )
+            logger.info(
+                f"  Key factors: {', '.join(analysis.key_factors)}"
+            )
+            logger.info(
+                f"  Risk flags: "
+                f"{', '.join(analysis.risk_flags) if analysis.risk_flags else 'none'}"
+            )
+            logger.info(f"  Reasoning: {analysis.reasoning}")
+
+            from datetime import datetime as _dt
+            self._ai_analysis_log.append({
+                "iteration": self._iteration,
+                "timestamp": _dt.now(),
+                "game_id": game_state.game_id,
+                "score": f"{game_state.away_team.team_abbreviation} {game_state.away_team.score} - "
+                         f"{game_state.home_team.team_abbreviation} {game_state.home_team.score}",
+                "period": f"{game_state.period.display_name} {game_state.clock}",
+                "home_market_price": float(home_market_price),
+                "edge_pct": estimate.edge_percentage,
+                "quant_confidence": estimate.confidence,
+                "assessment": analysis.market_assessment,
+                "ai_confidence": analysis.confidence,
+                "sentiment_adj": analysis.sentiment_adjustment,
+                "context_adj": analysis.context_adjustment,
+                "key_factors": analysis.key_factors,
+                "reasoning": analysis.reasoning,
+            })
 
     async def _execute_signal(self, signal: TradingSignal) -> None:
         """Execute a trading signal."""
-        # Check risk
+        # Convert USDC size to shares (Kelly sizing outputs USDC,
+        # but the executor and position tracker expect share counts).
+        size_in_shares = signal.size / signal.price
+
+        # Check risk (risk manager computes notional = shares * price = USDC)
         risk_check = self._risk_manager.check_order(
             market_id=signal.market_id,
             token_id=signal.token_id,
             side=signal.action,
-            size=signal.size,
+            size=size_in_shares,
             price=signal.price,
         )
 
@@ -929,28 +1400,27 @@ class TradingBot:
             logger.warning(f"Signal rejected by risk manager: {risk_check.reason}")
             return
 
-        # Adjust size if needed
-        size = risk_check.adjusted_size or signal.size
+        # Adjust size if needed (risk manager adjusted_size is already in shares)
+        order_size = risk_check.adjusted_size or size_in_shares
 
-        # Log signal
+        # Log signal (convert back to USDC for readability)
         self._trade_logger.log_signal(
             strategy_id=signal.strategy_id,
             game_id=signal.game_id,
             side=signal.side,
             edge=signal.edge_percentage,
             confidence=signal.confidence,
-            size=float(size),
+            size=float(order_size * signal.price),
         )
 
-        # Submit order
-        from ..data.models import TradeSide
+        # Submit order (size is in shares)
         side = TradeSide.BUY if signal.action == "buy" else TradeSide.SELL
 
         result = await self._order_manager.submit_order(
             market_id=signal.market_id,
             token_id=signal.token_id,
             side=side,
-            size=size,
+            size=order_size,
             price=signal.price,
             strategy_id=signal.strategy_id,
         )
@@ -961,7 +1431,7 @@ class TradingBot:
                 action="submit",
                 market_id=signal.market_id,
                 side=signal.action,
-                size=float(size),
+                size=float(order_size),
                 price=float(signal.price),
             )
 
@@ -981,7 +1451,37 @@ class TradingBot:
                 sell_price if sell_price is not None else position.avg_entry_price
             )
 
+        # Collect token_ids that already have pending/active sell orders
+        open_sell_tokens = {
+            o.token_id
+            for o in self._order_manager.get_all_open_orders()
+            if o.side == TradeSide.SELL
+        }
+
         for position in positions:
+            # Skip if there's already a pending/active sell order for this token
+            if position.token_id in open_sell_tokens:
+                logger.debug(
+                    f"  Skipping exit eval for {position.token_id}: "
+                    f"sell order already pending/active"
+                )
+                continue
+
+            current_price = price_map.get(position.token_id)
+
+            # Hard circuit breaker: force exit if position loss exceeds
+            # absolute limit, regardless of strategy stop-loss settings.
+            if current_price is not None and self._risk_manager.check_hard_loss_limit(
+                position, current_price
+            ):
+                hard_exit = ExitSignal(
+                    strategy_id=position.strategy_id or "risk_manager",
+                    position=position,
+                    reason=f"Hard circuit breaker (-{self._risk_manager.limits.hard_loss_limit_percent}%)",
+                )
+                await self._execute_exit(hard_exit, price_map)
+                continue
+
             game_id = self._token_id_to_game_id.get(position.token_id)
             if game_id is None:
                 continue
@@ -992,21 +1492,47 @@ class TradingBot:
                 position, game_state, price_map
             )
             if exit_signal is not None:
-                await self._execute_exit(exit_signal)
+                await self._execute_exit(exit_signal, price_map)
 
-    async def _execute_exit(self, exit_signal) -> None:
+    async def _execute_exit(
+        self, exit_signal, price_map: Optional[dict[str, Decimal]] = None,
+    ) -> None:
         """Execute a position exit."""
         position = exit_signal.position
 
-        # Submit sell order
-        from ..data.models import TradeSide
+        # Guard: skip if position is already closed (size<=0) to avoid
+        # submitting orders with zero amounts after a fill.
+        if position.size <= 0:
+            logger.warning(
+                f"Skipping exit for {position.token_id}: position size is "
+                f"{position.size} (already closed)"
+            )
+            return
 
+        # Use current market sell price so the paper executor can fill it.
+        # Falling back to entry price if no current price available.
+        sell_price = position.avg_entry_price
+        if price_map and position.token_id in price_map:
+            sell_price = price_map[position.token_id]
+
+        # Guard: write off dust positions below Polymarket minimum notional
+        MIN_SELL_NOTIONAL = Decimal("0.50")
+        notional = position.size * sell_price
+        if notional < MIN_SELL_NOTIONAL:
+            logger.warning(
+                f"Writing off dust position {position.token_id}: "
+                f"{position.size} shares worth ${notional:.4f}"
+            )
+            self._position_tracker.write_off_dust(position.token_id)
+            return
+
+        # Submit sell order
         result = await self._order_manager.submit_order(
             market_id=position.market_id,
             token_id=position.token_id,
             side=TradeSide.SELL,
             size=position.size,
-            price=position.avg_entry_price,  # Market order in real impl
+            price=sell_price,
             strategy_id=position.strategy_id,
         )
 
@@ -1131,9 +1657,9 @@ class TradingBot:
             available_balance=balance.available_usdc,
             realized_pnl=realized_pnl,
             unrealized_pnl=unrealized_pnl,
-            total_trades=performance_summary.get("total_trades", 0),
-            winning_trades=performance_summary.get("winning_trades", 0),
-            losing_trades=performance_summary.get("losing_trades", 0),
+            total_trades=position_stats.get("completed_trades", 0),
+            winning_trades=position_stats.get("winning_trades", 0),
+            losing_trades=position_stats.get("losing_trades", 0),
             open_positions=position_stats.get("open_positions", 0),
             pending_orders=self._order_manager.stats.get("pending_count", 0),
             total_exposure=Decimal(str(position_stats.get("total_exposure", 0))),

@@ -152,6 +152,14 @@ Examples:
         default=None,
         help="Number of price ticks / game states for --test-game (default: 20).",
     )
+    parser.add_argument(
+        "--test-game-scenario",
+        type=str,
+        default=None,
+        help="Test game scenario: home_blowout, away_blowout, close_game, "
+        "home_comeback, away_comeback, failed_comeback, overtime_thriller, "
+        "wire_to_wire, late_collapse, back_and_forth, or random (default: random).",
+    )
     # Edge (buy) filters
     parser.add_argument(
         "--min-edge",
@@ -318,8 +326,11 @@ def main() -> int:
         config.instance_id = args.instance_id
 
     if args.test_game:
+        from ..testing import resolve_scenario
+
         config.test_game = True
         config.test_game_ticks = args.test_game_ticks
+        config.test_game_scenario = resolve_scenario(args.test_game_scenario)
         if config.loop_interval == 30:
             config.loop_interval = 5
         # Leave max_iterations unchanged (None = unlimited), like a real game
@@ -477,13 +488,14 @@ async def run_bot_with_config(config: BotConfig) -> None:
     from ..utils.logger import setup_logging
 
     start_ts = datetime.now().strftime("%Y%m%d%H%M%S")
+    log_dir = Path("logs") / config.mode / start_ts
     setup_logging(
         level=config.log_level,
-        log_file=f"{start_ts}.txt",
-        log_dir=Path("logs"),
+        log_file="full.txt",
+        log_dir=log_dir,
     )
 
-    bot = TradingBot(config)
+    bot = TradingBot(config, log_dir=log_dir, start_ts=start_ts)
     await bot.start()
 
 
@@ -505,12 +517,16 @@ def print_banner(config: BotConfig) -> None:
     """
     print(banner)
     print(f"  Mode: {config.mode.upper()}")
-    print(f"  Bankroll: ${config.bankroll}")
+    if config.mode == "live":
+        print("  Bankroll: (fetching live balance...)")
+    else:
+        print(f"  Bankroll: ${config.bankroll}")
     print(f"  Strategies: {', '.join(config.active_strategies or ['default'])}")
     print(f"  Loop interval: {config.loop_interval}s")
     print(f"  Claude AI: {'enabled' if config.claude_enabled else 'disabled'}")
     if config.test_game:
-        print(f"  Test game: enabled ({config.test_game_ticks or 20} ticks)")
+        scenario_str = config.test_game_scenario or "random"
+        print(f"  Test game: enabled (scenario={scenario_str}, {config.test_game_ticks or 20} ticks)")
     print(
         f"  Edge: min={config.min_edge_percent}% max={config.max_edge_percent}% "
         f"conf>={config.min_confidence} time>={config.min_time_remaining_seconds}s "
