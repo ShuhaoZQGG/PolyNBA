@@ -54,6 +54,18 @@ class RuleContext:
         return abs(self.game_state.score_differential)
 
     @property
+    def estimated_probability(self) -> float:
+        """Get estimated probability for this side."""
+        return float(self.opportunity.estimated_probability)
+
+    @property
+    def spread_percentage(self) -> float:
+        """Get bid-ask spread as percentage of mid price (0 if unavailable)."""
+        if self.opportunity.spread_percentage is not None:
+            return self.opportunity.spread_percentage
+        return 0.0
+
+    @property
     def risk_flags(self) -> list[str]:
         """Get risk flags if available."""
         # This would come from Claude analysis if available
@@ -300,7 +312,8 @@ class RuleEngine:
         stop_loss_pct_override: Optional[float] = None,
         time_stop_seconds_override: Optional[int] = None,
         profit_target_percent_override: Optional[float] = None,
-    ) -> tuple[bool, str]:
+        spread_pct: float = 0.0,
+    ) -> tuple[bool, str, Optional[Decimal]]:
         """Evaluate exit conditions for a position.
 
         Args:
@@ -312,7 +325,8 @@ class RuleEngine:
             time_stop_seconds_override: If set, use instead of strategy exit_rules.time_stop_seconds
 
         Returns:
-            Tuple of (should_exit, reason)
+            Tuple of (should_exit, reason, limit_price) where limit_price is the
+            target sell price for the exit order (None for urgent exits like time stop).
         """
         exit_rules = strategy.exit_rules
         stop_loss_pct = (
@@ -339,41 +353,54 @@ class RuleEngine:
         # Global profit target override (take profit at X%)
         if profit_target_percent_override is not None:
             if pnl_percent >= profit_target_percent_override:
+                limit_price = position.avg_entry_price * (1 + Decimal(str(profit_target_percent_override)) / 100)
                 logger.info(
                     f"    -> Profit target (override): PnL {pnl_percent:.1f}% >= "
-                    f"{profit_target_percent_override:.1f}% -> SELL"
+                    f"{profit_target_percent_override:.1f}% -> SELL (limit={float(limit_price):.4f})"
                 )
-                return True, f"Profit target hit ({pnl_percent:.1f}%)"
+                return True, f"Profit target hit ({pnl_percent:.1f}%)", limit_price
             logger.info(
                 f"    -> Profit target (override): PnL {pnl_percent:.1f}% < "
                 f"{profit_target_percent_override:.1f}% -> no"
             )
 
-        # Dynamic stop loss: widen for low-price positions where normal volatility exceeds %
-        entry_price = float(position.avg_entry_price)
-        effective_stop_loss = stop_loss_pct
-        if entry_price < 0.35:
-            # Scale: multiplier from 1.0 (at 0.35) to 2.0 (at 0.0)
-            multiplier = min(2.0, max(1.0, 2.0 - (entry_price / 0.35)))
-            effective_stop_loss = stop_loss_pct * multiplier
-
-        # Time-based widening for late-game volatility (stacks with price-based)
-        for bucket in exit_rules.late_game_widening:
-            if time_remaining_seconds <= bucket.time_remaining_max:
-                effective_stop_loss *= bucket.multiplier
-                break  # First matching bucket wins (sorted descending by time)
-
-        stop_threshold = -effective_stop_loss
-        if pnl_percent <= stop_threshold:
-            logger.info(
-                f"    -> Stop loss: PnL {pnl_percent:.1f}% <= {stop_threshold:.1f}% "
-                f"(base={stop_loss_pct:.0f}%, effective={effective_stop_loss:.1f}%, entry@{entry_price:.2f}) -> SELL"
+        # Spread guard: suppress stop loss evaluation when spread is abnormally wide
+        spread_guard_active = False
+        max_spread = exit_rules.exit_max_spread_percent
+        if max_spread > 0 and spread_pct > max_spread:
+            spread_guard_active = True
+            logger.warning(
+                f"    -> Spread guard: spread {spread_pct:.1f}% > threshold {max_spread:.1f}% — "
+                f"suppressing stop loss evaluation (prices unreliable)"
             )
-            return True, f"Stop loss triggered ({pnl_percent:.1f}%, threshold {stop_threshold:.1f}%)"
-        logger.info(
-            f"    -> Stop loss: PnL {pnl_percent:.1f}% > {stop_threshold:.1f}% "
-            f"(base={stop_loss_pct:.0f}%, effective={effective_stop_loss:.1f}%, entry@{entry_price:.2f}) -> no"
-        )
+
+        if not spread_guard_active:
+            # Dynamic stop loss: widen for low-price positions where normal volatility exceeds %
+            entry_price = float(position.avg_entry_price)
+            effective_stop_loss = stop_loss_pct
+            if entry_price < 0.35:
+                # Scale: multiplier from 1.0 (at 0.35) to 2.0 (at 0.0)
+                multiplier = min(2.0, max(1.0, 2.0 - (entry_price / 0.35)))
+                effective_stop_loss = stop_loss_pct * multiplier
+
+            # Time-based widening for late-game volatility (stacks with price-based)
+            for bucket in exit_rules.late_game_widening:
+                if time_remaining_seconds <= bucket.time_remaining_max:
+                    effective_stop_loss *= bucket.multiplier
+                    break  # First matching bucket wins (sorted descending by time)
+
+            stop_threshold = -effective_stop_loss
+            if pnl_percent <= stop_threshold:
+                limit_price = position.avg_entry_price * (1 - Decimal(str(effective_stop_loss)) / 100)
+                logger.info(
+                    f"    -> Stop loss: PnL {pnl_percent:.1f}% <= {stop_threshold:.1f}% "
+                    f"(base={stop_loss_pct:.0f}%, effective={effective_stop_loss:.1f}%, entry@{entry_price:.2f}) -> SELL (limit={float(limit_price):.4f})"
+                )
+                return True, f"Stop loss triggered ({pnl_percent:.1f}%, threshold {stop_threshold:.1f}%)", limit_price
+            logger.info(
+                f"    -> Stop loss: PnL {pnl_percent:.1f}% > {stop_threshold:.1f}% "
+                f"(base={stop_loss_pct:.0f}%, effective={effective_stop_loss:.1f}%, entry@{entry_price:.2f}) -> no"
+            )
 
         # Check profit targets (time-based)
         matched_target = None
@@ -383,11 +410,12 @@ class RuleEngine:
                 break
         if matched_target is not None:
             if pnl_percent >= matched_target.target_percentage:
+                limit_price = position.avg_entry_price * (1 + Decimal(str(matched_target.target_percentage)) / 100)
                 logger.info(
                     f"    -> Profit target: PnL {pnl_percent:.1f}% >= {matched_target.target_percentage:.1f}% "
-                    f"(bucket time_left>={matched_target.time_remaining_min}s) -> SELL"
+                    f"(bucket time_left>={matched_target.time_remaining_min}s) -> SELL (limit={float(limit_price):.4f})"
                 )
-                return True, f"Profit target hit ({pnl_percent:.1f}%)"
+                return True, f"Profit target hit ({pnl_percent:.1f}%)", limit_price
             logger.info(
                 f"    -> Profit target: PnL {pnl_percent:.1f}% < {matched_target.target_percentage:.1f}% "
                 f"(bucket time_left>={matched_target.time_remaining_min}s) -> no"
@@ -402,13 +430,13 @@ class RuleEngine:
             logger.info(
                 f"    -> Time stop: time_left {time_remaining_seconds}s <= {time_stop_seconds}s -> SELL"
             )
-            return True, "Time stop triggered"
+            return True, "Time stop triggered", None
         logger.info(
             f"    -> Time stop: time_left {time_remaining_seconds}s > {time_stop_seconds}s -> no"
         )
 
         logger.info(f"    -> HOLD (no exit condition met)")
-        return False, ""
+        return False, "", None
 
     def calculate_position_size(
         self,

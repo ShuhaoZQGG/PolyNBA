@@ -335,11 +335,12 @@ class ReplayEngine:
                 entry_trade, position = open_positions[side]
                 current_price = snap.home_market_price if side == "home" else snap.away_market_price
 
-                should_exit, reason = self._rule_engine.evaluate_exit(
+                should_exit, reason, _limit_price = self._rule_engine.evaluate_exit(
                     strategy,
                     position,
                     current_price,
                     snap.total_seconds_remaining,
+                    spread_pct=0.0,  # Replay logs don't have spread data; guard stays disabled
                 )
 
                 if should_exit:

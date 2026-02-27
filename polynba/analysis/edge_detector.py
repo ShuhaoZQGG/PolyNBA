@@ -29,6 +29,7 @@ class EdgeOpportunity:
     confidence: int
     estimate: ProbabilityEstimate
     detected_at: datetime = field(default_factory=datetime.now)
+    spread_percentage: Optional[float] = None  # Bid-ask spread as % of mid price
 
     @property
     def expected_value(self) -> float:

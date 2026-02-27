@@ -202,6 +202,29 @@ class PriceFetcher:
             logger.debug(f"Error fetching sell price for token {token_id[:20]}...: {e}")
             return None
 
+    def get_token_price_info(self, token_id: str) -> tuple[Optional[Decimal], Optional[Decimal], float]:
+        """Get mid-price, best-bid, and spread % in one order book fetch.
+
+        Returns:
+            (mid_price, best_bid, spread_pct) — any element may be None/0.0 on failure.
+        """
+        try:
+            client = self._get_client()
+            book = client.get_order_book(token_id)
+            if not book:
+                return None, None, 0.0
+            best_bid = self._get_best_bid(book)
+            best_ask = self._get_best_ask(book)
+            mid_price = self._calculate_mid_price(best_bid, best_ask)
+            if mid_price and mid_price > 0 and best_bid is not None and best_ask is not None:
+                spread_pct = float((best_ask - best_bid) / mid_price) * 100.0
+            else:
+                spread_pct = 0.0
+            return mid_price, best_bid, spread_pct
+        except Exception as e:
+            logger.debug(f"Error fetching price info for token {token_id[:20]}...: {e}")
+            return None, None, 0.0
+
     def _parse_order_books(
         self,
         condition_id: str,
@@ -363,6 +386,7 @@ class TimeSeriesPriceFetcher:
         misprice_probability: float = 0.0,
         misprice_min_pct: float = 5.0,
         misprice_max_pct: float = 12.0,
+        live_simulator: Optional[object] = None,
     ):
         """Initialize with a list of MarketPrices (e.g. from generate_random_price_series).
 
@@ -376,6 +400,8 @@ class TimeSeriesPriceFetcher:
                 deliberate misprice so market diverges from model (e.g. 0.25 = 25% of ticks).
             misprice_min_pct: Min absolute misprice in percent (e.g. 5 = 5%).
             misprice_max_pct: Max absolute misprice in percent (e.g. 12 = 12%).
+            live_simulator: Optional LiveTestPriceSimulator. When set with game_state,
+                delegates to simulator.get_current_prices() for coordinated live pricing.
         """
         self._prices = prices
         self._wrap = wrap
@@ -385,6 +411,7 @@ class TimeSeriesPriceFetcher:
         self._misprice_probability = misprice_probability
         self._misprice_min_pct = misprice_min_pct
         self._misprice_max_pct = misprice_max_pct
+        self._live_simulator = live_simulator
         self._index = 0
         self._last_market: Optional[PolymarketNBAMarket] = None
         self._last_prices: Optional[MarketPrices] = None
@@ -463,6 +490,11 @@ class TimeSeriesPriceFetcher:
         game_state: Optional["GameState"] = None,
     ) -> Optional[MarketPrices]:
         """Return prices. If game_state given, use score+time win prob; else series/random walk."""
+        if game_state is not None and self._live_simulator is not None:
+            prices = self._live_simulator.get_current_prices(market, game_state)
+            self._last_market = market
+            self._last_prices = prices
+            return prices
         if game_state is not None:
             return self._prices_from_game_state(market, game_state)
         if not self._prices:
@@ -520,6 +552,27 @@ class TimeSeriesPriceFetcher:
         if token_id == self._last_market.away_token_id:
             return self._last_prices.away_best_bid
         return None
+
+    def get_token_price_info(self, token_id: str) -> tuple[Optional[Decimal], Optional[Decimal], float]:
+        """Get mid-price, best-bid, and spread % from cached last prices.
+
+        Returns:
+            (mid_price, best_bid, spread_pct) — any element may be None/0.0.
+        """
+        if self._last_market is None or self._last_prices is None:
+            return None, None, 0.0
+        p = self._last_prices
+        if token_id == self._last_market.home_token_id:
+            mid, bid, ask = p.home_mid_price, p.home_best_bid, p.home_best_ask
+        elif token_id == self._last_market.away_token_id:
+            mid, bid, ask = p.away_mid_price, p.away_best_bid, p.away_best_ask
+        else:
+            return None, None, 0.0
+        if mid and mid > 0 and bid is not None and ask is not None:
+            spread_pct = float((ask - bid) / mid) * 100.0
+        else:
+            spread_pct = 0.0
+        return mid, bid, spread_pct
 
 
 class SimulatedPriceFetcher:

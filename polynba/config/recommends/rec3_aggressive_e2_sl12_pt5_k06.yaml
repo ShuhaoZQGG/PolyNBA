@@ -71,6 +71,12 @@ entry_rules:
       operator: "<="
       value: 0.75
 
+    - name: "max_spread"
+      type: "threshold"
+      field: "spread_percentage"
+      operator: "<="
+      value: 8.0  # Skip entry when bid-ask spread is too wide
+
 exit_rules:
   profit_targets:
     - time_remaining_min: 1200
@@ -84,6 +90,7 @@ exit_rules:
 
   stop_loss:
     value: 12.0
+    exit_max_spread_percent: 15.0  # Suppress stop loss when spread > 15% (thin book)
     late_game_widening:
       - time_remaining_max: 600
         multiplier: 1.3

@@ -80,6 +80,7 @@ class ExitRules:
     stop_loss_percent: float = 10.0
     time_stop_seconds: int = 60
     late_game_widening: list[StopLossWideningBucket] = field(default_factory=list)
+    exit_max_spread_percent: float = 0.0  # Spread guard: suppress stop loss when spread > this (0 = disabled)
 
 
 @dataclass
@@ -272,6 +273,7 @@ class StrategyLoader:
             stop_loss_percent=stop_loss_data.get("value", 10.0),
             time_stop_seconds=exit_data.get("time_stop", {}).get("exit_before_seconds", 60),
             late_game_widening=late_game_widening,
+            exit_max_spread_percent=stop_loss_data.get("exit_max_spread_percent", 0.0),
         )
 
         # Parse position sizing

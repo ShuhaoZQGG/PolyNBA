@@ -346,7 +346,7 @@ class TestRuleEngine:
         # Price dropped 15% - should trigger stop loss at 10%
         current_price = Decimal("0.51")  # ~15% loss
 
-        should_exit, reason = engine.evaluate_exit(
+        should_exit, reason, limit_price = engine.evaluate_exit(
             sample_strategy,
             position,
             current_price,
@@ -355,6 +355,8 @@ class TestRuleEngine:
 
         assert should_exit is True
         assert "stop loss" in reason.lower()
+        # limit_price = entry * (1 - effective_stop_loss/100) = 0.60 * (1 - 10/100) = 0.54
+        assert limit_price == Decimal("0.60") * (1 - Decimal("10") / 100)
 
     def test_evaluate_exit_profit_target(self, sample_strategy):
         """Test exit evaluation for profit target."""
@@ -372,7 +374,7 @@ class TestRuleEngine:
         # Price increased 20% - should trigger 15% profit target
         current_price = Decimal("0.60")  # 20% profit
 
-        should_exit, reason = engine.evaluate_exit(
+        should_exit, reason, limit_price = engine.evaluate_exit(
             sample_strategy,
             position,
             current_price,
@@ -381,6 +383,137 @@ class TestRuleEngine:
 
         assert should_exit is True
         assert "profit target" in reason.lower()
+        # limit_price = entry * (1 + target/100) = 0.50 * (1 + 15/100) = 0.575
+        assert limit_price == Decimal("0.50") * (1 + Decimal("15") / 100)
+
+    def test_evaluate_exit_time_stop_limit_price_is_none(self, sample_strategy):
+        """Test that time stop exit returns None for limit_price (urgent exit)."""
+        engine = RuleEngine()
+
+        position = Position(
+            market_id="market1",
+            token_id="token1",
+            side=TradeSide.BUY,
+            size=Decimal("10"),
+            avg_entry_price=Decimal("0.50"),
+            total_cost=Decimal("5"),
+        )
+
+        # Price near entry (no profit target or stop loss triggered)
+        current_price = Decimal("0.51")
+
+        should_exit, reason, limit_price = engine.evaluate_exit(
+            sample_strategy,
+            position,
+            current_price,
+            time_remaining_seconds=30,  # < 60s time stop
+        )
+
+        assert should_exit is True
+        assert "time stop" in reason.lower()
+        assert limit_price is None
+
+    def test_evaluate_entry_spread_gate_passes(
+        self, sample_game_state, sample_opportunity
+    ):
+        """Test entry passes when spread is within threshold."""
+        # Create strategy with max_spread rule
+        strategy = StrategyConfig(
+            id="spread_test",
+            metadata=StrategyMetadata(name="Spread Test", enabled=True),
+            factor_weights=FactorWeights(),
+            entry_rules=EntryRules(
+                conditions=[
+                    RuleCondition(
+                        name="minimum_edge",
+                        type="threshold",
+                        field="edge_percentage",
+                        operator=">=",
+                        value=5.0,
+                    ),
+                    RuleCondition(
+                        name="max_spread",
+                        type="threshold",
+                        field="spread_percentage",
+                        operator="<=",
+                        value=8.0,
+                    ),
+                ]
+            ),
+            exit_rules=ExitRules(),
+            position_sizing=PositionSizing(),
+            risk_limits=StrategyRiskLimits(),
+        )
+
+        # Set spread below threshold
+        sample_opportunity.spread_percentage = 5.0
+
+        engine = RuleEngine()
+        context = RuleContext(
+            game_state=sample_game_state,
+            opportunity=sample_opportunity,
+        )
+
+        result = engine.evaluate_entry(strategy, context)
+        assert result.passed is True
+
+    def test_evaluate_entry_spread_gate_blocks(
+        self, sample_game_state, sample_opportunity
+    ):
+        """Test entry blocked when spread exceeds threshold."""
+        strategy = StrategyConfig(
+            id="spread_test",
+            metadata=StrategyMetadata(name="Spread Test", enabled=True),
+            factor_weights=FactorWeights(),
+            entry_rules=EntryRules(
+                conditions=[
+                    RuleCondition(
+                        name="minimum_edge",
+                        type="threshold",
+                        field="edge_percentage",
+                        operator=">=",
+                        value=5.0,
+                    ),
+                    RuleCondition(
+                        name="max_spread",
+                        type="threshold",
+                        field="spread_percentage",
+                        operator="<=",
+                        value=4.0,
+                    ),
+                ]
+            ),
+            exit_rules=ExitRules(),
+            position_sizing=PositionSizing(),
+            risk_limits=StrategyRiskLimits(),
+        )
+
+        # Set spread above threshold
+        sample_opportunity.spread_percentage = 7.5
+
+        engine = RuleEngine()
+        context = RuleContext(
+            game_state=sample_game_state,
+            opportunity=sample_opportunity,
+        )
+
+        result = engine.evaluate_entry(strategy, context)
+        assert result.passed is False
+        assert "max_spread" in result.failed_rules
+
+    def test_spread_percentage_defaults_to_zero(
+        self, sample_game_state, sample_opportunity
+    ):
+        """Test that spread_percentage returns 0 when not set on opportunity."""
+        # Don't set spread_percentage on the opportunity (defaults to None)
+        sample_opportunity.spread_percentage = None
+
+        context = RuleContext(
+            game_state=sample_game_state,
+            opportunity=sample_opportunity,
+        )
+
+        assert context.spread_percentage == 0.0
 
     def test_calculate_position_size_kelly(
         self, sample_strategy, sample_opportunity
@@ -398,3 +531,141 @@ class TestRuleEngine:
         # Should be within limits
         assert size >= Decimal("10")  # min_position
         assert size <= Decimal("100")  # max_position
+
+    def test_spread_guard_suppresses_stop_loss(self, sample_strategy):
+        """Test that stop loss is suppressed when spread exceeds threshold."""
+        # Configure spread guard
+        sample_strategy.exit_rules.exit_max_spread_percent = 15.0
+
+        engine = RuleEngine()
+        position = Position(
+            market_id="market1",
+            token_id="token1",
+            side=TradeSide.BUY,
+            size=Decimal("10"),
+            avg_entry_price=Decimal("0.60"),
+            total_cost=Decimal("6"),
+        )
+
+        # Price dropped 15% — would normally trigger 10% stop loss
+        current_price = Decimal("0.51")
+
+        should_exit, reason, limit_price = engine.evaluate_exit(
+            sample_strategy,
+            position,
+            current_price,
+            time_remaining_seconds=600,
+            spread_pct=20.0,  # Spread 20% > threshold 15%
+        )
+
+        # Stop loss should be suppressed
+        assert should_exit is False
+
+    def test_spread_guard_allows_profit_target(self, sample_strategy):
+        """Test that profit target still fires despite wide spread."""
+        sample_strategy.exit_rules.exit_max_spread_percent = 15.0
+
+        engine = RuleEngine()
+        position = Position(
+            market_id="market1",
+            token_id="token1",
+            side=TradeSide.BUY,
+            size=Decimal("10"),
+            avg_entry_price=Decimal("0.50"),
+            total_cost=Decimal("5"),
+        )
+
+        # Price increased 20% — should trigger 15% profit target
+        current_price = Decimal("0.60")
+
+        should_exit, reason, limit_price = engine.evaluate_exit(
+            sample_strategy,
+            position,
+            current_price,
+            time_remaining_seconds=900,
+            spread_pct=20.0,  # Wide spread — but profit targets are not affected
+        )
+
+        assert should_exit is True
+        assert "profit target" in reason.lower()
+
+    def test_spread_guard_allows_time_stop(self, sample_strategy):
+        """Test that time stop still fires despite wide spread."""
+        sample_strategy.exit_rules.exit_max_spread_percent = 15.0
+
+        engine = RuleEngine()
+        position = Position(
+            market_id="market1",
+            token_id="token1",
+            side=TradeSide.BUY,
+            size=Decimal("10"),
+            avg_entry_price=Decimal("0.50"),
+            total_cost=Decimal("5"),
+        )
+
+        current_price = Decimal("0.51")
+
+        should_exit, reason, limit_price = engine.evaluate_exit(
+            sample_strategy,
+            position,
+            current_price,
+            time_remaining_seconds=30,  # Below time stop
+            spread_pct=20.0,  # Wide spread — time stop not affected
+        )
+
+        assert should_exit is True
+        assert "time stop" in reason.lower()
+
+    def test_spread_guard_disabled_allows_stop_loss(self, sample_strategy):
+        """Test that stop loss fires normally when spread guard is disabled (threshold=0)."""
+        sample_strategy.exit_rules.exit_max_spread_percent = 0.0  # Disabled
+
+        engine = RuleEngine()
+        position = Position(
+            market_id="market1",
+            token_id="token1",
+            side=TradeSide.BUY,
+            size=Decimal("10"),
+            avg_entry_price=Decimal("0.60"),
+            total_cost=Decimal("6"),
+        )
+
+        current_price = Decimal("0.51")
+
+        should_exit, reason, limit_price = engine.evaluate_exit(
+            sample_strategy,
+            position,
+            current_price,
+            time_remaining_seconds=600,
+            spread_pct=20.0,  # Wide spread but guard is disabled
+        )
+
+        assert should_exit is True
+        assert "stop loss" in reason.lower()
+
+    def test_spread_below_threshold_allows_stop_loss(self, sample_strategy):
+        """Test that stop loss fires normally when spread is below threshold."""
+        sample_strategy.exit_rules.exit_max_spread_percent = 15.0
+
+        engine = RuleEngine()
+        position = Position(
+            market_id="market1",
+            token_id="token1",
+            side=TradeSide.BUY,
+            size=Decimal("10"),
+            avg_entry_price=Decimal("0.60"),
+            total_cost=Decimal("6"),
+        )
+
+        current_price = Decimal("0.51")
+
+        should_exit, reason, limit_price = engine.evaluate_exit(
+            sample_strategy,
+            position,
+            current_price,
+            time_remaining_seconds=600,
+            spread_pct=10.0,  # Spread 10% < threshold 15% — guard inactive
+        )
+
+        assert should_exit is True
+        assert "stop loss" in reason.lower()

@@ -41,6 +41,12 @@ entry_rules:
       operator: "<="
       value: 0.75
 
+    - name: "max_spread"
+      type: "threshold"
+      field: "spread_percentage"
+      operator: "<="
+      value: 4.0  # Only enter when bid-ask spread is tight
+
     - name: "no_risk_flags"
       type: "list_empty"
       field: "risk_flags"
@@ -55,9 +61,10 @@ exit_rules:
       target_percentage: 5.0
 
   stop_loss:
-    value: 10.0
+    value: 15.0  # Widened from 10% to absorb bid-ask spread cost on entry
+    exit_max_spread_percent: 15.0  # Suppress stop loss when spread > 15% (thin book)
     late_game_widening:
-      - time_remaining_max: 360   # <= 6 min: 1.5x → 15%
+      - time_remaining_max: 360   # <= 6 min: 1.5x → 22.5%
         multiplier: 1.5
 
   time_stop:

@@ -40,6 +40,7 @@ class ExitSignal:
     strategy_id: str
     position: Position
     reason: str
+    limit_price: Optional[Decimal] = None
 
 
 @dataclass
@@ -268,12 +269,14 @@ class StrategyManager:
         self,
         game_state: GameState,
         price_map: dict[str, Decimal],
+        spread_pct_map: Optional[dict[str, float]] = None,
     ) -> list[ExitSignal]:
         """Evaluate exit conditions for all positions.
 
         Args:
             game_state: Current game state
             price_map: Map of token_id to current price
+            spread_pct_map: Map of token_id to bid-ask spread % (for spread guard)
 
         Returns:
             List of exit signals
@@ -292,7 +295,8 @@ class StrategyManager:
             if current_price is None:
                 continue
 
-            should_exit, reason = self._rule_engine.evaluate_exit(
+            spread_pct = (spread_pct_map or {}).get(position.token_id, 0.0)
+            should_exit, reason, limit_price = self._rule_engine.evaluate_exit(
                 strategy,
                 position,
                 current_price,
@@ -300,6 +304,7 @@ class StrategyManager:
                 stop_loss_pct_override=self._exit_stop_loss_pct_override,
                 time_stop_seconds_override=self._exit_time_stop_seconds_override,
                 profit_target_percent_override=self._exit_profit_target_percent_override,
+                spread_pct=spread_pct,
             )
 
             if should_exit:
@@ -308,6 +313,7 @@ class StrategyManager:
                         strategy_id=position.strategy_id,
                         position=position,
                         reason=reason,
+                        limit_price=limit_price,
                     )
                 )
 
@@ -322,6 +328,7 @@ class StrategyManager:
         position: Position,
         game_state: GameState,
         price_map: dict[str, Decimal],
+        spread_pct_map: Optional[dict[str, float]] = None,
     ) -> Optional[ExitSignal]:
         """Evaluate exit conditions for a single position with its game state.
 
@@ -329,6 +336,7 @@ class StrategyManager:
             position: Position to evaluate
             game_state: Game state for the market this position belongs to
             price_map: Map of token_id to current price
+            spread_pct_map: Map of token_id to bid-ask spread % (for spread guard)
 
         Returns:
             ExitSignal if should exit, else None
@@ -341,7 +349,8 @@ class StrategyManager:
         current_price = price_map.get(position.token_id)
         if current_price is None:
             return None
-        should_exit, reason = self._rule_engine.evaluate_exit(
+        spread_pct = (spread_pct_map or {}).get(position.token_id, 0.0)
+        should_exit, reason, limit_price = self._rule_engine.evaluate_exit(
             strategy,
             position,
             current_price,
@@ -349,6 +358,7 @@ class StrategyManager:
             stop_loss_pct_override=self._exit_stop_loss_pct_override,
             time_stop_seconds_override=self._exit_time_stop_seconds_override,
             profit_target_percent_override=self._exit_profit_target_percent_override,
+            spread_pct=spread_pct,
         )
         if not should_exit:
             return None
@@ -359,6 +369,7 @@ class StrategyManager:
             strategy_id=position.strategy_id,
             position=position,
             reason=reason,
+            limit_price=limit_price,
         )
 
     def _can_take_position(self, strategy: StrategyConfig, game_id: str) -> bool:
