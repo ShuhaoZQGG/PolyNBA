@@ -2,8 +2,10 @@
 
 from .test_game_provider import TestDataManager, TestGameProvider, resolve_scenario
 from .mock_mapper import TestMarketMapper
+from .live_price_simulator import LiveTestPriceSimulator
 
 __all__ = [
+    "LiveTestPriceSimulator",
     "TestDataManager",
     "TestGameProvider",
     "TestMarketMapper",

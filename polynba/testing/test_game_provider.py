@@ -13,6 +13,7 @@ from ..data.models import (
     GameSummary,
     Period,
     PlayEvent,
+    TeamContext,
     TeamGameState,
     TeamStats,
 )
@@ -624,6 +625,15 @@ class TestDataManager:
         """Return the single test game (same as live for test mode)."""
         summary = self._provider.get_summary()
         return [summary] if summary.is_live else []
+
+    async def get_team_context(
+        self, team_id: str, opponent_id: str | None = None
+    ) -> TeamContext | None:
+        """Return a TeamContext with test stats and no injuries."""
+        stats = await self.get_team_stats(team_id)
+        if not stats:
+            return None
+        return TeamContext(stats=stats)
 
     async def close(self) -> None:
         """No-op for test manager."""
