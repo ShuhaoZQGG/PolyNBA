@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from ..data.models import OrderStatus, TradeSide
 
@@ -218,12 +218,17 @@ class PaperTradingExecutor(TradingExecutor):
         self,
         initial_balance: Decimal = Decimal("1000"),
         slippage_bps: int = 10,  # 0.1% slippage simulation
+        live_price_source: Optional["Callable[[str], Optional[MarketData]]"] = None,
     ):
         """Initialize paper trading executor.
 
         Args:
             initial_balance: Starting USDC balance
             slippage_bps: Simulated slippage in basis points
+            live_price_source: Optional callable that returns fresh MarketData
+                for a given token_id. When set, get_market_data() calls this
+                instead of returning static cache, enabling price evolution
+                during order delay checks.
         """
         self._balance = initial_balance
         self._locked_balance = Decimal("0")
@@ -232,6 +237,7 @@ class PaperTradingExecutor(TradingExecutor):
         self._positions: dict[str, Decimal] = {}
         self._order_counter = 0
         self._market_data_cache: dict[str, MarketData] = {}
+        self._live_price_source = live_price_source
 
     def set_market_data(self, market_id: str, data: MarketData) -> None:
         """Set market data for simulation.
@@ -440,7 +446,12 @@ class PaperTradingExecutor(TradingExecutor):
         )
 
     async def get_market_data(self, market_id: str) -> Optional[MarketData]:
-        """Get cached market data."""
+        """Get market data, using live price source if available."""
+        if self._live_price_source is not None:
+            fresh = self._live_price_source(market_id)
+            if fresh is not None:
+                self._market_data_cache[market_id] = fresh
+                return fresh
         return self._market_data_cache.get(market_id)
 
     async def get_positions(self) -> dict[str, Decimal]:

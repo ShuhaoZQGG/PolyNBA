@@ -274,10 +274,17 @@ class OrderManager:
 
         deviation = abs(current_price - initial) / initial * 100
 
+        logger.debug(
+            f"Price check #{len(pending.price_checks)} for {pending.order.order_id}: "
+            f"{float(current_price):.4f} (initial {float(initial):.4f}, "
+            f"deviation {deviation:.2f}%)"
+        )
+
         if deviation > self._config.max_price_deviation_percent:
             logger.warning(
                 f"Price deviation {deviation:.2f}% exceeds threshold "
-                f"for order {pending.order.order_id}"
+                f"{self._config.max_price_deviation_percent}% — "
+                f"auto-cancelling order {pending.order.order_id}"
             )
             return True
 

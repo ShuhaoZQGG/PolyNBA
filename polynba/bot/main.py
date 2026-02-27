@@ -279,6 +279,14 @@ Examples:
         metavar="USD",
         help="Skip signal if position size below USD (global min).",
     )
+    # Conviction bets
+    parser.add_argument(
+        "--conviction-min-probability",
+        type=float,
+        default=None,
+        metavar="P",
+        help="Minimum probability (0-1) for conviction bets (e.g. 0.65); 0 = disabled.",
+    )
 
     return parser.parse_args()
 
@@ -375,6 +383,8 @@ def main() -> int:
         config.kelly_multiplier_override = args.kelly_multiplier
     if args.min_position_usdc is not None:
         config.min_position_usdc = args.min_position_usdc
+    if args.conviction_min_probability is not None:
+        config.conviction_min_probability = args.conviction_min_probability
 
     # Print startup banner
     print_banner(config)
@@ -559,6 +569,8 @@ def print_banner(config: BotConfig) -> None:
         print(f"  Min position: ${config.min_position_usdc}")
     if config.instance_id is not None:
         print(f"  Instance: {config.instance_id} (port {8765 + config.instance_id})")
+    if config.conviction_min_probability > 0:
+        print(f"  Conviction: min probability {config.conviction_min_probability:.0%}")
     if config.allowed_game_ids:
         print(f"  Focus games: {len(config.allowed_game_ids)} game(s)")
     print()

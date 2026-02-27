@@ -22,7 +22,7 @@ from ..analysis import (
     ProbabilityCalculator,
 )
 from ..data import DataManager, GameState, TeamStats
-from ..data.models import GameStatus, TeamContext, TradeSide
+from ..data.models import GameStatus, Period, TeamContext, TradeSide
 from ..polymarket import (
     MarketDiscovery,
     MarketMapper,
@@ -30,7 +30,7 @@ from ..polymarket import (
     TimeSeriesPriceFetcher,
     generate_random_price_series,
 )
-from ..testing import TestDataManager, TestMarketMapper
+from ..testing import LiveTestPriceSimulator, TestDataManager, TestMarketMapper
 from ..testing.mock_mapper import TEST_CONDITION_ID
 from ..strategy import CapitalAllocation, ExitSignal, StrategyManager, TradingSignal
 from ..trading import (
@@ -71,6 +71,7 @@ class BotConfig:
     mode: str = "paper"
     bankroll: float = 500.0
     loop_interval: int = 30
+    position_check_interval: int = 5  # seconds between background position checks
     max_iterations: Optional[int] = None
     active_strategies: list[str] = None
     claude_enabled: bool = True
@@ -140,6 +141,9 @@ class BotConfig:
     kelly_multiplier_override: Optional[float] = None  # Scale strategy Kelly (e.g. 0.5 = half); None = use strategy
     min_edge_strategy_overrides: Dict[str, float] = field(default_factory=dict)  # Per-strategy min edge % (e.g. {"conservative": 3.0, "aggressive": 5.0})
 
+    # Conviction bets
+    conviction_min_probability: float = 0.0  # 0 = disabled; e.g. 0.65 = 65% threshold
+
     @classmethod
     def from_yaml(cls, path: Path) -> "BotConfig":
         """Load config from YAML file."""
@@ -158,6 +162,7 @@ class BotConfig:
             mode=data.get("mode", "paper"),
             bankroll=data.get("bankroll", 500.0),
             loop_interval=data.get("loop", {}).get("interval_seconds", 30),
+            position_check_interval=data.get("loop", {}).get("position_check_interval", 5),
             max_iterations=data.get("loop", {}).get("max_iterations"),
             active_strategies=data.get("active_strategies", ["conservative"]),
             claude_enabled=data.get("apis", {}).get("claude", {}).get("enabled", True),
@@ -219,6 +224,8 @@ class BotConfig:
                 str(k): float(v)
                 for k, v in (data.get("edge", {}).get("min_edge_strategy_overrides") or {}).items()
             },
+            # Conviction
+            conviction_min_probability=float(data.get("conviction", {}).get("min_probability", 0.0)),
         )
 
 
@@ -251,22 +258,27 @@ class TradingBot:
         self._game_identity: Optional[tuple[str, str]] = None
 
         # Core components (or test-game mocks)
+        self._live_simulator = None
         if config.test_game:
             n_ticks = config.test_game_ticks or 20
             self._data_manager = TestDataManager(
                 n_game_states=n_ticks, scenario=config.test_game_scenario
             )
             self._market_mapper = TestMarketMapper()
+            self._live_simulator = LiveTestPriceSimulator(
+                market=self._market_mapper._market,
+                misprice_probability=0.40,
+                misprice_min_pct=6.0,
+                misprice_max_pct=15.0,
+            )
             self._price_fetcher = TimeSeriesPriceFetcher(
                 prices=generate_random_price_series(
                     n_ticks, condition_id=TEST_CONDITION_ID
                 ),
-                misprice_probability=0.15,
-                misprice_min_pct=5.0,
-                misprice_max_pct=12.0,
+                live_simulator=self._live_simulator,
             )
             self._fallback_to_simulated = False
-            logger.info("Test game mode: using mock game and time-series prices")
+            logger.info("Test game mode: using mock game with live price simulator")
         else:
             self._data_manager = data_manager or DataManager()
             self._market_mapper = None
@@ -293,7 +305,12 @@ class TradingBot:
             logger.info("Using LIVE trading executor")
         else:
             self._executor = PaperTradingExecutor(
-                initial_balance=Decimal(str(config.bankroll))
+                initial_balance=Decimal(str(config.bankroll)),
+                live_price_source=(
+                    self._live_simulator.get_market_data_for_token
+                    if self._live_simulator
+                    else None
+                ),
             )
             logger.info("Using PAPER trading executor")
 
@@ -312,10 +329,11 @@ class TradingBot:
             limits=risk_limits,
             position_tracker=self._position_tracker,
         )
-        # In test-game mode, disable the price-deviation auto-cancel because
-        # simulated prices jump much faster than real markets.
+        # In test-game mode, enable auto-cancel with the live price simulator
+        # providing micro-tick noise during the 3s delay so prices evolve
+        # realistically between delay checks.
         delay_cfg = (
-            DelayConfig(enable_auto_cancel=False)
+            DelayConfig(enable_auto_cancel=True)
             if config.test_game
             else None
         )
@@ -399,10 +417,18 @@ class TradingBot:
         self._ai_analysis_log: list[dict] = []
         self._last_live_balance: Optional[Decimal] = None
 
+        # Per-game risk tracking (mirrors replay_engine logic)
+        self._last_stop_loss_iteration: dict[str, int] = {}   # token_id -> iteration
+        self._game_stop_loss_count: dict[str, int] = {}        # game_id -> count
+        self._game_cumulative_pnl: dict[str, Decimal] = {}     # game_id -> PnL
+
         # AI analysis deduplication and rate limiting
         self._last_analyzed_state: dict[str, str] = {}  # game_id -> state hash
         self._last_ai_call_time: dict[str, float] = {}  # game_id -> timestamp
         self._last_analyzed_score: dict[str, tuple[int, int]] = {}  # game_id -> (home, away)
+
+        # Conviction: store latest Claude analysis per game for conviction entry checks
+        self._last_claude_analysis: dict = {}  # game_id -> ClaudeAnalysisResponse
 
     async def start(self) -> None:
         """Start the trading bot."""
@@ -438,6 +464,7 @@ class TradingBot:
         await self._start_command_server()
 
         self._running = True
+        position_monitor = asyncio.create_task(self._position_monitor_loop())
 
         try:
             await self._main_loop()
@@ -446,6 +473,11 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Bot error: {e}", exc_info=True)
         finally:
+            position_monitor.cancel()
+            try:
+                await position_monitor
+            except asyncio.CancelledError:
+                pass
             await self.stop()
 
     async def _verify_polymarket_connection(self) -> None:
@@ -498,7 +530,13 @@ class TradingBot:
         """Stop the trading bot."""
         logger.info("Stopping PolyNBA bot")
 
-        # Generate summary before cleanup so all data is still available
+        # Close all open positions while order manager is still active
+        try:
+            await self._close_all_positions()
+        except Exception as e:
+            logger.error(f"Error closing positions during shutdown: {e}")
+
+        # Generate summary after closing positions so it reflects final PnL
         self._write_summary()
 
         self._running = False
@@ -976,6 +1014,11 @@ class TradingBot:
             logger.info(f"  Game is at {game_state.status.value}, skipping analysis and entries")
             return
 
+        # Block entries near halftime to avoid volatility spike
+        if game_state.period == Period.SECOND_QUARTER and game_state.clock_seconds <= 120:
+            logger.info(f"  Near halftime ({game_state.clock_seconds}s left in Q2), skipping entries")
+            return
+
         # Get market data (in real impl, would fetch from Polymarket)
         market_data = await self._get_market_data(game_id, game_state)
         if not market_data:
@@ -1015,7 +1058,15 @@ class TradingBot:
         )
 
         # Optionally enhance with Claude analysis
-        if self._claude_analyzer and abs(estimate.edge_percentage) >= self._config.min_edge_percent:
+        conviction_thresh = self._config.conviction_min_probability
+        high_prob_for_ai = conviction_thresh > 0 and (
+            float(estimate.estimated_probability) >= conviction_thresh
+            or float(Decimal("1") - estimate.estimated_probability) >= conviction_thresh
+        )
+        if self._claude_analyzer and (
+            abs(estimate.edge_percentage) >= self._config.min_edge_percent
+            or high_prob_for_ai
+        ):
             if self._should_run_ai_analysis(game_id, game_state):
                 await self._enhance_with_claude(
                     game_state, home_market_price, estimate, home_stats, away_stats,
@@ -1055,13 +1106,76 @@ class TradingBot:
                         f"  No edge opportunity (need >= {filt.min_edge_percent}% edge)"
                     )
         else:
+            # Annotate opportunities with bid-ask spread data
             for opportunity in opportunities:
+                spread_key = f"{opportunity.side}_spread_pct"
+                spread_pct = market_data.get(spread_key)
+                opportunity.spread_percentage = spread_pct
+
+                spread_str = f"{spread_pct:.1f}%" if spread_pct is not None else "N/A"
                 logger.info(
                     f"  >>> EDGE FOUND: {opportunity.side.upper()} "
                     f"{opportunity.team_abbreviation} | "
                     f"Edge: {opportunity.edge_percentage:+.2f}% | "
-                    f"EV: {opportunity.expected_value:.2%}"
+                    f"EV: {opportunity.expected_value:.2%} | "
+                    f"Spread: {spread_str}"
                 )
+
+        # Generate conviction opportunities for high-probability side (AI-confirmed, no risk flags)
+        if conviction_thresh > 0:
+            ai_analysis = self._last_claude_analysis.get(game_id)
+            ai_clear = ai_analysis is not None and not ai_analysis.risk_flags
+            if ai_clear:
+                existing_sides = {o.side for o in opportunities}
+                home_prob = float(estimate.estimated_probability)
+                away_prob = 1.0 - home_prob
+
+                if home_prob >= conviction_thresh and "home" not in existing_sides:
+                    home_spread = market_data.get("home_spread_pct")
+                    opportunities.append(EdgeOpportunity(
+                        game_id=game_state.game_id,
+                        market_id=market_data["home_market_id"],
+                        token_id=market_data["home_token_id"],
+                        side="home",
+                        team_name=game_state.home_team.team_name,
+                        team_abbreviation=game_state.home_team.team_abbreviation,
+                        market_price=estimate.market_price,
+                        estimated_probability=estimate.estimated_probability,
+                        edge=estimate.edge,
+                        edge_percentage=estimate.edge_percentage,
+                        confidence=estimate.confidence,
+                        estimate=estimate,
+                        spread_percentage=home_spread,
+                    ))
+                    logger.info(
+                        f"  >>> CONVICTION: {game_state.home_team.team_abbreviation} "
+                        f"prob={home_prob:.1%} (AI-enhanced, no risk flags)"
+                    )
+
+                if away_prob >= conviction_thresh and "away" not in existing_sides:
+                    away_buy = estimate.away_market_price or (Decimal("1") - estimate.market_price)
+                    away_est = Decimal("1") - estimate.estimated_probability
+                    away_edge = away_est - away_buy
+                    away_spread = market_data.get("away_spread_pct")
+                    opportunities.append(EdgeOpportunity(
+                        game_id=game_state.game_id,
+                        market_id=market_data["away_market_id"],
+                        token_id=market_data["away_token_id"],
+                        side="away",
+                        team_name=game_state.away_team.team_name,
+                        team_abbreviation=game_state.away_team.team_abbreviation,
+                        market_price=away_buy,
+                        estimated_probability=away_est,
+                        edge=away_edge,
+                        edge_percentage=float(away_edge * 100),
+                        confidence=estimate.confidence,
+                        estimate=estimate,
+                        spread_percentage=away_spread,
+                    ))
+                    logger.info(
+                        f"  >>> CONVICTION: {game_state.away_team.team_abbreviation} "
+                        f"prob={away_prob:.1%} (AI-enhanced, no risk flags)"
+                    )
 
         # Evaluate against strategies
         signals_count = 0
@@ -1088,6 +1202,44 @@ class TradingBot:
                             f"cost=${float(existing.total_cost):.2f})"
                         )
                         continue
+
+                    # --- Risk guards (mirrors replay_engine) ---
+                    strategy = self._strategy_manager.get_strategy(signal.strategy_id)
+                    if strategy:
+                        rl = strategy.risk_limits
+
+                        # 1. Per-game loss cap
+                        if rl.max_loss_per_game_usdc > 0:
+                            cum_pnl = self._game_cumulative_pnl.get(game_id, Decimal("0"))
+                            cap = Decimal(str(rl.max_loss_per_game_usdc))
+                            if cum_pnl <= -cap:
+                                logger.info(
+                                    f"  Skipping buy: game loss cap reached "
+                                    f"(PnL ${float(cum_pnl):+.2f} <= -${float(cap):.2f})"
+                                )
+                                continue
+
+                        # 2. Max stop losses per game
+                        if rl.max_stop_losses_per_game > 0:
+                            sl_count = self._game_stop_loss_count.get(game_id, 0)
+                            if sl_count >= rl.max_stop_losses_per_game:
+                                logger.info(
+                                    f"  Skipping buy: max stop losses reached "
+                                    f"({sl_count}/{rl.max_stop_losses_per_game})"
+                                )
+                                continue
+
+                        # 3. Cooldown after stop-loss
+                        if rl.cooldown_iterations > 0:
+                            last_sl_iter = self._last_stop_loss_iteration.get(signal.token_id)
+                            if last_sl_iter is not None:
+                                iters_since = self._iteration - last_sl_iter
+                                if iters_since < rl.cooldown_iterations:
+                                    logger.info(
+                                        f"  Skipping buy: cooldown active "
+                                        f"({iters_since}/{rl.cooldown_iterations} iters since stop loss)"
+                                    )
+                                    continue
 
                 signals_count += 1
                 logger.info(
@@ -1183,6 +1335,22 @@ class TradingBot:
                         best_ask=prices.away_best_ask,
                         outcome="away",
                     )
+                    # Compute spread % for each outcome (relative to mid price)
+                    home_spread_pct = None
+                    away_spread_pct = None
+                    if prices.home_best_bid and prices.home_best_ask:
+                        home_mid = (prices.home_best_bid + prices.home_best_ask) / 2
+                        if home_mid > 0:
+                            home_spread_pct = float(
+                                (prices.home_best_ask - prices.home_best_bid) / home_mid * 100
+                            )
+                    if prices.away_best_bid and prices.away_best_ask:
+                        away_mid = (prices.away_best_bid + prices.away_best_ask) / 2
+                        if away_mid > 0:
+                            away_spread_pct = float(
+                                (prices.away_best_ask - prices.away_best_bid) / away_mid * 100
+                            )
+
                     return {
                         "home_market_id": mapping.polymarket_market.condition_id,
                         "home_token_id": mapping.polymarket_market.home_token_id,
@@ -1192,6 +1360,8 @@ class TradingBot:
                         "away_price": away_buy_price,
                         "source": "polymarket",
                         "liquidity": mapping.polymarket_market.liquidity,
+                        "home_spread_pct": home_spread_pct,
+                        "away_spread_pct": away_spread_pct,
                     }
                 else:
                     logger.warning(
@@ -1347,11 +1517,27 @@ class TradingBot:
         )
 
         if analysis:
+            # Apply AI probability adjustment to estimate (previously only logged, not applied)
+            adjusted_prob = self._claude_analyzer.apply_to_probability(
+                estimate.estimated_probability, analysis
+            )
+            old_prob = float(estimate.estimated_probability)
+            estimate.estimated_probability = adjusted_prob
+            estimate.edge = adjusted_prob - estimate.market_price
+            estimate.edge_percentage = float(estimate.edge * 100)
+
+            # Store analysis for conviction entry checks
+            self._last_claude_analysis[game_state.game_id] = analysis
+
             logger.info(
                 f"Claude analysis for {game_state.game_id}: "
                 f"assessment={analysis.market_assessment} conf={analysis.confidence} "
                 f"sentiment_adj={analysis.sentiment_adjustment} "
                 f"context_adj={analysis.context_adjustment}"
+            )
+            logger.info(
+                f"  AI adjustment: prob {old_prob:.1%} -> {float(adjusted_prob):.1%} | "
+                f"edge now {estimate.edge_percentage:+.2f}%"
             )
             logger.info(
                 f"  Key factors: {', '.join(analysis.key_factors)}"
@@ -1435,21 +1621,57 @@ class TradingBot:
                 price=float(signal.price),
             )
 
+    async def _position_monitor_loop(self) -> None:
+        """Background loop that checks positions more frequently than the main loop."""
+        interval = self._config.position_check_interval
+        logger.info(f"Position monitor started (every {interval}s)")
+        while self._running:
+            try:
+                if self._position_tracker.get_all_positions():
+                    await self._manage_positions()
+            except Exception as e:
+                logger.error(f"Position monitor error: {e}", exc_info=True)
+            await asyncio.sleep(interval)
+
     async def _manage_positions(self) -> None:
         """Manage existing positions."""
         positions = self._position_tracker.get_all_positions()
         if not positions:
             return
         logger.info(f"  [Exit check] Evaluating {len(positions)} position(s)")
-        # Get current prices for all positions (best bid = sell price)
-        price_map = {}
+        # Get mid-price (for P&L / exit evaluation), best-bid (for execution),
+        # and spread % (for spread guard) in one API call per token.
+        mid_price_map: dict[str, Decimal] = {}
+        bid_price_map: dict[str, Decimal] = {}
+        spread_pct_map: dict[str, float] = {}
         for position in positions:
-            sell_price = await asyncio.to_thread(
-                self._price_fetcher.get_token_sell_price, position.token_id
-            )
-            price_map[position.token_id] = (
-                sell_price if sell_price is not None else position.avg_entry_price
-            )
+            if hasattr(self._price_fetcher, "get_token_price_info"):
+                mid, bid, spread_pct = await asyncio.to_thread(
+                    self._price_fetcher.get_token_price_info, position.token_id
+                )
+            else:
+                # Fallback for fetchers without get_token_price_info
+                bid = await asyncio.to_thread(
+                    self._price_fetcher.get_token_sell_price, position.token_id
+                )
+                mid, spread_pct = bid, 0.0
+            fallback = position.avg_entry_price
+            mid_price_map[position.token_id] = mid if mid is not None else fallback
+            bid_price_map[position.token_id] = bid if bid is not None else fallback
+            spread_pct_map[position.token_id] = spread_pct if spread_pct else 0.0
+            # Log divergence when mid vs bid differs >5%
+            mid_val = mid_price_map[position.token_id]
+            bid_val = bid_price_map[position.token_id]
+            if mid_val > 0 and bid_val > 0:
+                divergence_pct = float((mid_val - bid_val) / mid_val) * 100
+                if abs(divergence_pct) > 5.0:
+                    logger.warning(
+                        f"  Mid/bid divergence for {position.token_id[:20]}...: "
+                        f"mid={float(mid_val):.4f} bid={float(bid_val):.4f} "
+                        f"({divergence_pct:+.1f}%) spread={spread_pct_map[position.token_id]:.1f}%"
+                    )
+        # Use mid_price_map for strategy evaluation, bid_price_map for execution
+        price_map = mid_price_map
 
         # Collect token_ids that already have pending/active sell orders
         open_sell_tokens = {
@@ -1467,10 +1689,11 @@ class TradingBot:
                 )
                 continue
 
-            current_price = price_map.get(position.token_id)
+            current_price = mid_price_map.get(position.token_id)
 
             # Hard circuit breaker: force exit if position loss exceeds
             # absolute limit, regardless of strategy stop-loss settings.
+            # Uses mid-price for evaluation (fair value).
             if current_price is not None and self._risk_manager.check_hard_loss_limit(
                 position, current_price
             ):
@@ -1479,7 +1702,7 @@ class TradingBot:
                     position=position,
                     reason=f"Hard circuit breaker (-{self._risk_manager.limits.hard_loss_limit_percent}%)",
                 )
-                await self._execute_exit(hard_exit, price_map)
+                await self._execute_exit(hard_exit, bid_price_map)
                 continue
 
             game_id = self._token_id_to_game_id.get(position.token_id)
@@ -1489,10 +1712,10 @@ class TradingBot:
             if game_state is None:
                 continue
             exit_signal = self._strategy_manager.evaluate_position(
-                position, game_state, price_map
+                position, game_state, mid_price_map, spread_pct_map
             )
             if exit_signal is not None:
-                await self._execute_exit(exit_signal, price_map)
+                await self._execute_exit(exit_signal, bid_price_map)
 
     async def _execute_exit(
         self, exit_signal, price_map: Optional[dict[str, Decimal]] = None,
@@ -1509,11 +1732,24 @@ class TradingBot:
             )
             return
 
-        # Use current market sell price so the paper executor can fill it.
-        # Falling back to entry price if no current price available.
-        sell_price = position.avg_entry_price
-        if price_map and position.token_id in price_map:
+        # Use limit price from exit signal when available (profit target / stop loss),
+        # fall back to current market price, then entry price as last resort.
+        if exit_signal.limit_price is not None:
+            sell_price = exit_signal.limit_price
+        elif price_map and position.token_id in price_map:
             sell_price = price_map[position.token_id]
+        else:
+            sell_price = position.avg_entry_price
+
+        # Clamp sell_price to current market if limit is above market (gap past SL)
+        if price_map and position.token_id in price_map:
+            current_market = price_map[position.token_id]
+            if current_market > 0 and sell_price > current_market:
+                logger.warning(
+                    f"Exit limit {float(sell_price):.4f} above market "
+                    f"{float(current_market):.4f} - using market price"
+                )
+                sell_price = current_market
 
         # Guard: write off dust positions below Polymarket minimum notional
         MIN_SELL_NOTIONAL = Decimal("0.50")
@@ -1540,6 +1776,74 @@ class TradingBot:
             logger.info(
                 f"Exit order submitted for {position.token_id}: {exit_signal.reason}"
             )
+
+            # Track cumulative PnL per game
+            game_id = self._token_id_to_game_id.get(position.token_id, "")
+            if game_id:
+                pnl = position.unrealized_pnl(sell_price)
+                self._game_cumulative_pnl[game_id] = (
+                    self._game_cumulative_pnl.get(game_id, Decimal("0")) + pnl
+                )
+
+            # Track stop losses for cooldown / per-game limits
+            reason_lower = exit_signal.reason.lower()
+            if "stop loss" in reason_lower or "circuit breaker" in reason_lower:
+                self._last_stop_loss_iteration[position.token_id] = self._iteration
+                if game_id:
+                    self._game_stop_loss_count[game_id] = (
+                        self._game_stop_loss_count.get(game_id, 0) + 1
+                    )
+                    logger.info(
+                        f"  Stop loss #{self._game_stop_loss_count[game_id]} for game {game_id} "
+                        f"| Game PnL: ${float(self._game_cumulative_pnl.get(game_id, 0)):+.2f}"
+                    )
+
+    async def _close_all_positions(self) -> None:
+        """Close all open positions at market price during shutdown."""
+        positions = self._position_tracker.get_all_positions()
+        if not positions:
+            logger.info("SHUTDOWN: No open positions to close")
+            return
+
+        logger.warning(f"SHUTDOWN: Force-closing {len(positions)} open position(s)")
+        for position in positions:
+            try:
+                sell_price = await asyncio.to_thread(
+                    self._price_fetcher.get_token_sell_price, position.token_id
+                )
+                if sell_price is None:
+                    sell_price = position.avg_entry_price
+
+                # Skip dust positions
+                notional = position.size * sell_price
+                if notional < Decimal("0.50"):
+                    logger.info(
+                        f"SHUTDOWN: Skipping dust position {position.token_id} "
+                        f"(${float(notional):.4f})"
+                    )
+                    continue
+
+                result = await self._order_manager.submit_order(
+                    market_id=position.market_id,
+                    token_id=position.token_id,
+                    side=TradeSide.SELL,
+                    size=position.size,
+                    price=sell_price,
+                    strategy_id=position.strategy_id,
+                )
+                if result.success:
+                    logger.info(
+                        f"SHUTDOWN: Sell order submitted for {position.token_id} "
+                        f"@ {float(sell_price):.4f}"
+                    )
+                else:
+                    logger.error(
+                        f"SHUTDOWN: Failed to close {position.token_id}: {result}"
+                    )
+            except Exception as e:
+                logger.error(
+                    f"SHUTDOWN: Error closing position {position.token_id}: {e}"
+                )
 
     def _on_order_fill(self, order) -> None:
         """Callback when order fills."""
