@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from ...data.models import TeamContext, TeamStats
+from ...data.models import PlayerInjury, PlayerSeasonStats, TeamContext, TeamStats
 
 logger = logging.getLogger(__name__)
 
@@ -273,19 +273,159 @@ class TeamStrengthFactor:
         diff = home_streak - away_streak
         return diff * 5
 
+    def _player_injury_impact(self, injury: PlayerInjury) -> float:
+        """Estimate net rating impact of losing one player using EIR + NET_RATING.
+
+        When both EIR and per-player net_rating are available, blends them
+        (65% EIR, 35% NET_RATING) for a more accurate estimate. Positive
+        net_rating means full penalty when lost; negative net_rating reduces
+        the penalty. Falls back to EIR-only or basic stats when data is missing.
+        """
+        if not injury.player_stats:
+            return -(3.0 + 0.5 * 2.5) * 0.05  # ~-0.2 fallback
+
+        s = injury.player_stats
+        eir = s.estimated_impact_rating
+
+        if eir > 0:
+            # EIR-based impact: scale EIR by replacement difficulty
+            if eir >= 25:
+                replacement_difficulty = 0.35
+            elif eir >= 18:
+                replacement_difficulty = 0.28
+            elif eir >= 12:
+                replacement_difficulty = 0.20
+            elif eir >= 8:
+                replacement_difficulty = 0.12
+            else:
+                replacement_difficulty = 0.05
+
+            eir_impact = -(eir * replacement_difficulty)
+
+            # Blend with per-player NET_RATING when available
+            if s.net_rating != 0.0:
+                # net_rating is pts per 100 possessions — scale to comparable range
+                # Positive NR = good player, full penalty when lost
+                # Negative NR = bad player, reduced penalty
+                nr_impact = -(s.net_rating * 0.3)
+                return 0.65 * eir_impact + 0.35 * nr_impact
+
+            return eir_impact
+
+        # Fallback: basic stats when no extended data
+        scoring_value = s.points_per_game + s.assists_per_game * 2.5
+        total_value = scoring_value + s.rebounds_per_game * 0.5
+
+        if total_value >= 25:
+            replacement_pct = 0.35
+        elif total_value >= 15:
+            replacement_pct = 0.25
+        elif total_value >= 8:
+            replacement_pct = 0.15
+        else:
+            replacement_pct = 0.05
+
+        return -(total_value * replacement_pct)
+
+    # Position compatibility groups for replacement matching
+    _POSITION_COMPAT: dict[str, set[str]] = {
+        "G": {"G", "G-F", "PG", "SG"},
+        "F": {"F", "G-F", "F-C", "SF", "PF"},
+        "C": {"C", "F-C", "PF"},
+        "PG": {"PG", "G", "SG", "G-F"},
+        "SG": {"SG", "G", "PG", "G-F"},
+        "SF": {"SF", "F", "G-F", "PF"},
+        "PF": {"PF", "F", "F-C", "C", "SF"},
+        "G-F": {"G-F", "G", "F", "SG", "SF"},
+        "F-C": {"F-C", "F", "C", "PF"},
+    }
+
+    def _analyze_replacement_quality(self, ctx: TeamContext) -> float:
+        """Analyze how well bench players can replace injured starters.
+
+        For each injured starter, find the best available bench player at a
+        compatible position and compare their EIR.
+
+        Returns:
+            Positive offset (0-15) that reduces injury damage when bench depth
+            is strong.
+        """
+        injured_starters = [
+            inj for inj in ctx.key_players_out
+            if inj.player_stats and inj.player_stats.minutes_per_game >= 28
+        ]
+        if not injured_starters:
+            return 0.0
+
+        # Build set of injured player names for exclusion
+        injured_names = {inj.player_name for inj in ctx.injuries}
+
+        # Collect available bench players with EIR data
+        bench_players: list[PlayerSeasonStats] = []
+        for name, ps in ctx.player_stats_map.items():
+            if name not in injured_names and ps.is_bench and ps.estimated_impact_rating > 0:
+                bench_players.append(ps)
+
+        if not bench_players:
+            return 0.0
+
+        total_ratio = 0.0
+        matched = 0
+
+        for inj in injured_starters:
+            starter = inj.player_stats
+            if not starter or starter.estimated_impact_rating <= 0:
+                continue
+
+            # Find best bench replacement at compatible position
+            compat = self._POSITION_COMPAT.get(starter.position, {starter.position})
+            candidates = [bp for bp in bench_players if bp.position in compat]
+            if not candidates:
+                candidates = bench_players  # any position as fallback
+
+            best = max(candidates, key=lambda p: p.estimated_impact_rating)
+            ratio = best.estimated_impact_rating / starter.estimated_impact_rating
+            total_ratio += min(ratio, 1.0)  # cap at 1.0
+            matched += 1
+
+            logger.debug(
+                f"  Replacement: {inj.player_name} (EIR {starter.estimated_impact_rating:.1f}) "
+                f"-> {best.player_name} (EIR {best.estimated_impact_rating:.1f}, ratio {ratio:.2f})"
+            )
+
+        if matched == 0:
+            return 0.0
+
+        avg_ratio = total_ratio / matched
+
+        # Score: high ratio (>0.7) = good depth, low ratio (<0.4) = thin bench
+        # Map ratio 0.0-1.0 -> offset 0-15
+        offset = avg_ratio * 15.0
+        return offset
+
     def _analyze_injuries(
         self, home_ctx: TeamContext, away_ctx: TeamContext
     ) -> int:
-        """Analyze injury impact on team strength."""
-        home_out = len(home_ctx.key_players_out)
-        away_out = len(away_ctx.key_players_out)
+        """Analyze injury impact on team strength using EIR + replacement quality."""
+        home_impact = sum(
+            self._player_injury_impact(inj) for inj in home_ctx.key_players_out
+        )
+        away_impact = sum(
+            self._player_injury_impact(inj) for inj in away_ctx.key_players_out
+        )
 
-        # Each key player out ≈ -15 impact
-        home_impact = -home_out * 15
-        away_impact = -away_out * 15
+        # Scale to match NET_RATING_FACTOR (×3 converts lost-points to score scale)
+        home_score = home_impact * 3
+        away_score = away_impact * 3
 
-        # Net impact on home team's advantage
-        return home_impact - away_impact
+        # Replacement quality offsets: good bench depth reduces injury damage
+        home_repl_quality = self._analyze_replacement_quality(home_ctx)
+        away_repl_quality = self._analyze_replacement_quality(away_ctx)
+
+        # Net impact on home team's advantage (positive = home benefits)
+        injury_net = home_score - away_score
+        replacement_net = home_repl_quality - away_repl_quality
+        return int(injury_net + replacement_net)
 
     def _identify_advantages(
         self,

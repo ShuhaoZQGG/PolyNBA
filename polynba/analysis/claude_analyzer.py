@@ -202,6 +202,7 @@ Provide your analysis in the structured format."""
         quant_analysis: str,
         game_id: str,
         force: bool = False,
+        prompt_template: Optional[str] = None,
     ) -> Optional[ClaudeAnalysisResponse]:
         """Analyze game situation using Claude.
 
@@ -211,6 +212,9 @@ Provide your analysis in the structured format."""
             quant_analysis: Quantitative analysis summary
             game_id: Game identifier for caching
             force: Force analysis even if rate limited
+            prompt_template: Optional custom prompt template. Must contain
+                {game_context}, {market_context}, {quant_analysis} placeholders.
+                If None, uses the default ANALYSIS_PROMPT.
 
         Returns:
             ClaudeAnalysisResponse or None if skipped
@@ -239,7 +243,7 @@ Provide your analysis in the structured format."""
             client = await self._get_client()
 
             # Build prompt
-            prompt = self.ANALYSIS_PROMPT.format(
+            prompt = (prompt_template or self.ANALYSIS_PROMPT).format(
                 game_context=game_context,
                 market_context=market_context,
                 quant_analysis=quant_analysis,
