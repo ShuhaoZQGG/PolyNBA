@@ -59,6 +59,9 @@ exit_rules:
   stop_loss:
     value: 40.0           # Wide stop — conviction bets ride volatility
     exit_max_spread_percent: 15.0  # Suppress stop loss when spread > 15% (thin book)
+    patience_before_seconds: 600    # Suppress SL when > 10 min left (conviction = patience)
+    max_averagedown_count: 1        # Allow 1 average-down buy
+    max_averagedown_multiplier: 2.0 # Max 2x initial cost
     late_game_widening:
       - time_remaining_max: 600
         multiplier: 1.3
@@ -81,3 +84,4 @@ risk_limits:
   cooldown_iterations: 15
   max_stop_losses_per_game: 1   # Only 1 shot per game for conviction
   max_loss_per_game_usdc: 20
+  profit_cooldown_iterations: 10

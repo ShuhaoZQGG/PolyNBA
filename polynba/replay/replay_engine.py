@@ -229,6 +229,18 @@ def apply_overrides(strategy: StrategyConfig, overrides: dict) -> StrategyConfig
     if "max_loss_per_game_usdc" in overrides:
         s.risk_limits.max_loss_per_game_usdc = overrides["max_loss_per_game_usdc"]
 
+    if "profit_cooldown_iterations" in overrides:
+        s.risk_limits.profit_cooldown_iterations = overrides["profit_cooldown_iterations"]
+
+    if "patience_before_seconds" in overrides:
+        s.exit_rules.patience_before_seconds = overrides["patience_before_seconds"]
+
+    if "max_averagedown_count" in overrides:
+        s.exit_rules.max_averagedown_count = overrides["max_averagedown_count"]
+
+    if "max_averagedown_multiplier" in overrides:
+        s.exit_rules.max_averagedown_multiplier = overrides["max_averagedown_multiplier"]
+
     return s
 
 
@@ -323,6 +335,10 @@ class ReplayEngine:
         last_stop_loss_iteration: dict[str, int] = {}  # side -> iteration
         game_stop_loss_count = 0
 
+        # Profit-taking cooldown tracking
+        profit_cooldown_iterations = strategy.risk_limits.profit_cooldown_iterations
+        last_profit_taking_iteration: dict[str, int] = {}  # side -> iteration
+
         # Per-game loss cap tracking
         max_loss_per_game = Decimal(str(strategy.risk_limits.max_loss_per_game_usdc))
         game_cumulative_pnl = Decimal("0")
@@ -387,6 +403,10 @@ class ReplayEngine:
                                 f"on {side} | Game PnL: ${game_cumulative_pnl:+.2f}"
                             )
 
+                    # Track profit-taking exits for cooldown
+                    if "profit target" in reason.lower():
+                        last_profit_taking_iteration[side] = snap.iteration
+
                     if verbose:
                         logger.info(
                             f"  [Iter {snap.iteration}] EXIT {side} @ {current_price} "
@@ -417,6 +437,18 @@ class ReplayEngine:
                             logger.info(
                                 f"  [Iter {snap.iteration}] Cooldown: {side} stopped out "
                                 f"{iters_since_stop} iters ago (need {cooldown_iterations})"
+                            )
+                        continue
+
+                # Profit-taking cooldown: skip entry if recently took profit on this side
+                if profit_cooldown_iterations > 0 and side in last_profit_taking_iteration:
+                    iters_since_pt = snap.iteration - last_profit_taking_iteration[side]
+                    if iters_since_pt < profit_cooldown_iterations:
+                        if verbose:
+                            logger.info(
+                                f"  [Iter {snap.iteration}] Profit cooldown: {side} "
+                                f"took profit {iters_since_pt} iters ago "
+                                f"(need {profit_cooldown_iterations})"
                             )
                         continue
 

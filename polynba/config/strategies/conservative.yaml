@@ -63,6 +63,9 @@ exit_rules:
   stop_loss:
     value: 15.0  # Widened from 10% to absorb bid-ask spread cost on entry
     exit_max_spread_percent: 15.0  # Suppress stop loss when spread > 15% (thin book)
+    patience_before_seconds: 300    # Suppress SL when > 5 min left
+    max_averagedown_count: 1        # Allow 1 average-down buy
+    max_averagedown_multiplier: 2.0 # Max 2x initial cost
     late_game_widening:
       - time_remaining_max: 360   # <= 6 min: 1.5x → 22.5%
         multiplier: 1.5
@@ -83,3 +86,4 @@ risk_limits:
   cooldown_iterations: 10
   max_stop_losses_per_game: 2
   max_loss_per_game_usdc: 10
+  profit_cooldown_iterations: 8

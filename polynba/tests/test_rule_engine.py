@@ -669,3 +669,145 @@ class TestRuleEngine:
 
         assert should_exit is True
         assert "stop loss" in reason.lower()
+
+
+class TestProfitCooldown:
+    """Tests for profit-taking cooldown behavior."""
+
+    def test_profit_cooldown_config_defaults(self):
+        """Test that new config fields have correct defaults."""
+        risk_limits = StrategyRiskLimits()
+        assert risk_limits.profit_cooldown_iterations == 0
+
+        exit_rules = ExitRules()
+        assert exit_rules.patience_before_seconds == 0
+        assert exit_rules.max_averagedown_count == 0
+        assert exit_rules.max_averagedown_multiplier == 3.0
+
+    def test_profit_cooldown_config_custom_values(self):
+        """Test that new config fields accept custom values."""
+        risk_limits = StrategyRiskLimits(profit_cooldown_iterations=10)
+        assert risk_limits.profit_cooldown_iterations == 10
+
+        exit_rules = ExitRules(
+            patience_before_seconds=300,
+            max_averagedown_count=2,
+            max_averagedown_multiplier=2.5,
+        )
+        assert exit_rules.patience_before_seconds == 300
+        assert exit_rules.max_averagedown_count == 2
+        assert exit_rules.max_averagedown_multiplier == 2.5
+
+    def test_profit_cooldown_in_replay_engine(self):
+        """Test that profit cooldown blocks re-entry in replay engine."""
+        from polynba.replay.replay_engine import apply_overrides
+
+        strategy = StrategyConfig(
+            id="test",
+            metadata=StrategyMetadata(name="Test", enabled=True),
+            factor_weights=FactorWeights(),
+            entry_rules=EntryRules(),
+            exit_rules=ExitRules(),
+            position_sizing=PositionSizing(),
+            risk_limits=StrategyRiskLimits(profit_cooldown_iterations=5),
+        )
+
+        # Apply overrides
+        overridden = apply_overrides(strategy, {"profit_cooldown_iterations": 10})
+        assert overridden.risk_limits.profit_cooldown_iterations == 10
+
+    def test_patience_override_in_replay_engine(self):
+        """Test that patience/averaging overrides work in replay engine."""
+        from polynba.replay.replay_engine import apply_overrides
+
+        strategy = StrategyConfig(
+            id="test",
+            metadata=StrategyMetadata(name="Test", enabled=True),
+            factor_weights=FactorWeights(),
+            entry_rules=EntryRules(),
+            exit_rules=ExitRules(),
+            position_sizing=PositionSizing(),
+            risk_limits=StrategyRiskLimits(),
+        )
+
+        overridden = apply_overrides(strategy, {
+            "patience_before_seconds": 600,
+            "max_averagedown_count": 3,
+            "max_averagedown_multiplier": 2.0,
+        })
+        assert overridden.exit_rules.patience_before_seconds == 600
+        assert overridden.exit_rules.max_averagedown_count == 3
+        assert overridden.exit_rules.max_averagedown_multiplier == 2.0
+
+
+class TestPatientStopLoss:
+    """Tests for patient stop loss behavior."""
+
+    def test_stop_loss_still_fires_when_patience_disabled(self):
+        """Test stop loss fires normally when patience_before_seconds=0."""
+        strategy = StrategyConfig(
+            id="test",
+            metadata=StrategyMetadata(name="Test", enabled=True),
+            factor_weights=FactorWeights(),
+            entry_rules=EntryRules(),
+            exit_rules=ExitRules(
+                stop_loss_percent=10.0,
+                patience_before_seconds=0,  # Disabled
+            ),
+            position_sizing=PositionSizing(),
+            risk_limits=StrategyRiskLimits(),
+        )
+
+        engine = RuleEngine()
+        position = Position(
+            market_id="market1",
+            token_id="token1",
+            side=TradeSide.BUY,
+            size=Decimal("10"),
+            avg_entry_price=Decimal("0.60"),
+            total_cost=Decimal("6"),
+        )
+
+        current_price = Decimal("0.51")  # ~15% loss
+        should_exit, reason, limit_price = engine.evaluate_exit(
+            strategy, position, current_price,
+            time_remaining_seconds=900,  # Plenty of time left
+        )
+
+        assert should_exit is True
+        assert "stop loss" in reason.lower()
+
+    def test_stop_loss_fires_in_final_minutes(self):
+        """Test stop loss fires when time is within patience threshold."""
+        strategy = StrategyConfig(
+            id="test",
+            metadata=StrategyMetadata(name="Test", enabled=True),
+            factor_weights=FactorWeights(),
+            entry_rules=EntryRules(),
+            exit_rules=ExitRules(
+                stop_loss_percent=10.0,
+                patience_before_seconds=300,  # Suppress when > 5 min
+            ),
+            position_sizing=PositionSizing(),
+            risk_limits=StrategyRiskLimits(),
+        )
+
+        engine = RuleEngine()
+        position = Position(
+            market_id="market1",
+            token_id="token1",
+            side=TradeSide.BUY,
+            size=Decimal("10"),
+            avg_entry_price=Decimal("0.60"),
+            total_cost=Decimal("6"),
+        )
+
+        # Time is within patience (200s < 300s) — SL should fire normally
+        current_price = Decimal("0.51")
+        should_exit, reason, limit_price = engine.evaluate_exit(
+            strategy, position, current_price,
+            time_remaining_seconds=200,
+        )
+
+        assert should_exit is True
+        assert "stop loss" in reason.lower()

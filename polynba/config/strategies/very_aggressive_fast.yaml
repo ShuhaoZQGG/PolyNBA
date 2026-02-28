@@ -61,6 +61,9 @@ exit_rules:
   stop_loss:
     value: 15.0  # Base stop-loss; dynamically widened for low-price positions (< 0.35)
     exit_max_spread_percent: 15.0  # Suppress stop loss when spread > 15% (thin book)
+    patience_before_seconds: 300    # Suppress SL when > 5 min left
+    max_averagedown_count: 2        # Allow 2 average-down buys
+    max_averagedown_multiplier: 3.0 # Max 3x initial cost
     late_game_widening:
       - time_remaining_max: 720   # <= 12 min: 1.5x → 22.5%
         multiplier: 1.5
@@ -85,3 +88,4 @@ risk_limits:
   cooldown_iterations: 10
   max_stop_losses_per_game: 2
   max_loss_per_game_usdc: 15
+  profit_cooldown_iterations: 3

@@ -422,6 +422,13 @@ class TradingBot:
         self._game_stop_loss_count: dict[str, int] = {}        # game_id -> count
         self._game_cumulative_pnl: dict[str, Decimal] = {}     # game_id -> PnL
 
+        # Standing profit-target orders: token_id -> (order_id, current_target_pct, game_id)
+        self._standing_tp_orders: dict[str, tuple[str, float, str]] = {}
+        # Average-down state: token_id -> (averagedown_count, initial_entry_cost)
+        self._averagedown_state: dict[str, tuple[int, Decimal]] = {}
+        # Profit-taking cooldown: token_id -> iteration when last profit-taking exit occurred
+        self._last_profit_taking_iteration: dict[str, int] = {}
+
         # AI analysis deduplication and rate limiting
         self._last_analyzed_state: dict[str, str] = {}  # game_id -> state hash
         self._last_ai_call_time: dict[str, float] = {}  # game_id -> timestamp
@@ -1241,6 +1248,18 @@ class TradingBot:
                                     )
                                     continue
 
+                        # 4. Cooldown after profit-taking
+                        if rl.profit_cooldown_iterations > 0:
+                            last_pt_iter = self._last_profit_taking_iteration.get(signal.token_id)
+                            if last_pt_iter is not None:
+                                iters_since = self._iteration - last_pt_iter
+                                if iters_since < rl.profit_cooldown_iterations:
+                                    logger.info(
+                                        f"  Skipping buy: profit cooldown active "
+                                        f"({iters_since}/{rl.profit_cooldown_iterations} iters since profit taking)"
+                                    )
+                                    continue
+
                 signals_count += 1
                 logger.info(
                     f"  >>> SIGNAL: {signal.strategy_id} | "
@@ -1638,6 +1657,10 @@ class TradingBot:
         positions = self._position_tracker.get_all_positions()
         if not positions:
             return
+
+        # Update standing profit-target orders (tier changes as game progresses)
+        await self._update_standing_tp_orders()
+
         logger.info(f"  [Exit check] Evaluating {len(positions)} position(s)")
         # Get mid-price (for P&L / exit evaluation), best-bid (for execution),
         # and spread % (for spread guard) in one API call per token.
@@ -1715,6 +1738,28 @@ class TradingBot:
                 position, game_state, mid_price_map, spread_pct_map
             )
             if exit_signal is not None:
+                # Patient stop loss: suppress SL before final minutes, optionally average down
+                reason_lower = exit_signal.reason.lower()
+                if "stop loss" in reason_lower:
+                    strategy = self._strategy_manager.get_strategy(position.strategy_id)
+                    if strategy:
+                        patience = strategy.exit_rules.patience_before_seconds
+                        if patience > 0 and game_state.total_seconds_remaining > patience:
+                            # Patience active — try averaging down or just hold
+                            current_price = mid_price_map.get(position.token_id)
+                            if current_price is not None and current_price < position.avg_entry_price:
+                                avg_ok = await self._try_average_down(
+                                    position, game_state, strategy, current_price
+                                )
+                                if avg_ok:
+                                    continue  # Averaged down, skip exit
+                            # Hold — suppress stop loss
+                            logger.info(
+                                f"  Patient SL: suppressing stop loss for {position.token_id[:20]}... "
+                                f"({game_state.total_seconds_remaining}s > {patience}s patience threshold)"
+                            )
+                            continue
+
                 await self._execute_exit(exit_signal, bid_price_map)
 
     async def _execute_exit(
@@ -1798,6 +1843,181 @@ class TradingBot:
                         f"| Game PnL: ${float(self._game_cumulative_pnl.get(game_id, 0)):+.2f}"
                     )
 
+            # Track profit-taking exits for cooldown
+            if "profit target" in reason_lower:
+                self._last_profit_taking_iteration[position.token_id] = self._iteration
+
+            # Clean up standing TP order and average-down state
+            self._standing_tp_orders.pop(position.token_id, None)
+            self._averagedown_state.pop(position.token_id, None)
+
+    async def _place_standing_profit_target(self, token_id: str) -> None:
+        """Place a standing limit sell order at the profit target price."""
+        position = self._position_tracker.get_position(token_id)
+        if not position or position.size <= 0:
+            return
+
+        strategy = self._strategy_manager.get_strategy(position.strategy_id)
+        if not strategy or not strategy.exit_rules.profit_targets:
+            return
+
+        game_id = self._token_id_to_game_id.get(token_id)
+        if not game_id:
+            return
+        game_state = self._active_games.get(game_id)
+        if not game_state:
+            return
+
+        # Find matching profit target tier for current game time
+        matched_target = None
+        for target in strategy.exit_rules.profit_targets:
+            if game_state.total_seconds_remaining >= target.time_remaining_min:
+                matched_target = target
+                break
+        if matched_target is None:
+            return
+
+        target_pct = matched_target.target_percentage
+        sell_price = position.avg_entry_price * (1 + Decimal(str(target_pct)) / 100)
+
+        # Don't place if sell price is unreasonable (>= 1.0 for prediction markets)
+        if sell_price >= Decimal("0.99"):
+            return
+
+        result = await self._order_manager.submit_order(
+            market_id=position.market_id,
+            token_id=token_id,
+            side=TradeSide.SELL,
+            size=position.size,
+            price=sell_price,
+            strategy_id=position.strategy_id,
+        )
+
+        if result.success and result.order:
+            self._standing_tp_orders[token_id] = (
+                result.order.order_id, target_pct, game_id
+            )
+            logger.info(
+                f"  Standing TP order placed for {token_id[:20]}...: "
+                f"SELL @ {float(sell_price):.4f} ({target_pct:.1f}% target)"
+            )
+
+    async def _update_standing_tp_orders(self) -> None:
+        """Update standing profit-target orders if game time changed tiers."""
+        for token_id in list(self._standing_tp_orders.keys()):
+            position = self._position_tracker.get_position(token_id)
+            if not position or position.size <= 0:
+                # Position closed — clean up
+                old_order_id, _, _ = self._standing_tp_orders.pop(token_id)
+                try:
+                    await self._order_manager.cancel_order(old_order_id)
+                except Exception:
+                    pass
+                continue
+
+            old_order_id, old_target_pct, game_id = self._standing_tp_orders[token_id]
+            game_state = self._active_games.get(game_id)
+            if not game_state:
+                continue
+
+            strategy = self._strategy_manager.get_strategy(position.strategy_id)
+            if not strategy or not strategy.exit_rules.profit_targets:
+                continue
+
+            # Find current tier
+            matched_target = None
+            for target in strategy.exit_rules.profit_targets:
+                if game_state.total_seconds_remaining >= target.time_remaining_min:
+                    matched_target = target
+                    break
+            if matched_target is None:
+                continue
+
+            new_target_pct = matched_target.target_percentage
+            if abs(new_target_pct - old_target_pct) < 0.01:
+                continue  # Same tier, no update needed
+
+            # Cancel old order, place new one
+            try:
+                await self._order_manager.cancel_order(old_order_id)
+            except Exception as e:
+                logger.warning(f"Failed to cancel old TP order {old_order_id}: {e}")
+            self._standing_tp_orders.pop(token_id, None)
+
+            # Place updated order
+            await self._place_standing_profit_target(token_id)
+
+    async def _try_average_down(
+        self,
+        position,
+        game_state,
+        strategy,
+        current_price: Decimal,
+    ) -> bool:
+        """Try to average down on a position. Returns True if order placed."""
+        exit_rules = strategy.exit_rules
+        max_count = exit_rules.max_averagedown_count
+        max_mult = exit_rules.max_averagedown_multiplier
+
+        if max_count <= 0:
+            return False
+
+        state = self._averagedown_state.get(position.token_id)
+        if not state:
+            return False
+
+        count, initial_cost = state
+        if count >= max_count:
+            logger.info(
+                f"  Average down: max count reached ({count}/{max_count}) "
+                f"for {position.token_id[:20]}..."
+            )
+            return False
+
+        # Check cost multiplier limit
+        if position.total_cost >= initial_cost * Decimal(str(max_mult)):
+            logger.info(
+                f"  Average down: cost limit reached "
+                f"(${float(position.total_cost):.2f} >= "
+                f"{max_mult}x * ${float(initial_cost):.2f})"
+            )
+            return False
+
+        # Calculate buy size: half of initial entry cost, capped by strategy max
+        buy_usdc = initial_cost / 2
+        max_pos = Decimal(str(strategy.position_sizing.max_position_usdc))
+        buy_usdc = min(buy_usdc, max_pos - position.total_cost)
+        if buy_usdc < Decimal("5"):
+            return False
+
+        buy_size = buy_usdc / current_price
+        result = await self._order_manager.submit_order(
+            market_id=position.market_id,
+            token_id=position.token_id,
+            side=TradeSide.BUY,
+            size=buy_size,
+            price=current_price,
+            strategy_id=position.strategy_id,
+        )
+
+        if result.success:
+            self._averagedown_state[position.token_id] = (count + 1, initial_cost)
+            logger.info(
+                f"  Average down #{count + 1}/{max_count} for {position.token_id[:20]}...: "
+                f"BUY ${float(buy_usdc):.2f} @ {float(current_price):.4f}"
+            )
+            # Cancel and re-place standing TP order (avg entry price changed)
+            if position.token_id in self._standing_tp_orders:
+                old_order_id = self._standing_tp_orders[position.token_id][0]
+                try:
+                    await self._order_manager.cancel_order(old_order_id)
+                except Exception:
+                    pass
+                self._standing_tp_orders.pop(position.token_id, None)
+                # Will be re-placed by the BUY fill callback (_on_order_fill)
+            return True
+        return False
+
     async def _close_all_positions(self) -> None:
         """Close all open positions at market price during shutdown."""
         positions = self._position_tracker.get_all_positions()
@@ -1855,6 +2075,20 @@ class TradingBot:
                 fill_price=float(order.avg_fill_price),
                 fill_size=float(order.filled_size),
             )
+
+        # On BUY fill: record initial entry cost and schedule standing TP order
+        if order.side == TradeSide.BUY:
+            if order.token_id not in self._averagedown_state:
+                position = self._position_tracker.get_position(order.token_id)
+                if position:
+                    self._averagedown_state[order.token_id] = (0, position.total_cost)
+            # Schedule standing profit-target sell order
+            asyncio.ensure_future(self._place_standing_profit_target(order.token_id))
+
+        # On SELL fill: clean up standing TP order and average-down state
+        if order.side == TradeSide.SELL:
+            self._standing_tp_orders.pop(order.token_id, None)
+            self._averagedown_state.pop(order.token_id, None)
 
     def _on_order_cancel(self, order) -> None:
         """Callback when order cancels."""

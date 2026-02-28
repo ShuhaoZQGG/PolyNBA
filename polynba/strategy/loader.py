@@ -81,6 +81,9 @@ class ExitRules:
     time_stop_seconds: int = 60
     late_game_widening: list[StopLossWideningBucket] = field(default_factory=list)
     exit_max_spread_percent: float = 0.0  # Spread guard: suppress stop loss when spread > this (0 = disabled)
+    patience_before_seconds: int = 0      # Suppress SL when game has > N seconds left (0 = disabled)
+    max_averagedown_count: int = 0        # Max times to average down per position (0 = disabled)
+    max_averagedown_multiplier: float = 3.0  # Max total position cost = mult * initial entry cost
 
 
 @dataclass
@@ -107,6 +110,7 @@ class StrategyRiskLimits:
     cooldown_iterations: int = 0  # Iterations to wait after stop loss before re-entry
     max_stop_losses_per_game: int = 0  # Max stop losses per game (0 = unlimited)
     max_loss_per_game_usdc: float = 0.0  # Per-game loss cap in USDC (0 = unlimited)
+    profit_cooldown_iterations: int = 0  # Cooldown after profit taking (0 = disabled)
 
 
 @dataclass
@@ -274,6 +278,9 @@ class StrategyLoader:
             time_stop_seconds=exit_data.get("time_stop", {}).get("exit_before_seconds", 60),
             late_game_widening=late_game_widening,
             exit_max_spread_percent=stop_loss_data.get("exit_max_spread_percent", 0.0),
+            patience_before_seconds=int(stop_loss_data.get("patience_before_seconds", 0)),
+            max_averagedown_count=int(stop_loss_data.get("max_averagedown_count", 0)),
+            max_averagedown_multiplier=float(stop_loss_data.get("max_averagedown_multiplier", 3.0)),
         )
 
         # Parse position sizing
@@ -298,6 +305,7 @@ class StrategyLoader:
             cooldown_iterations=risk_data.get("cooldown_iterations", 0),
             max_stop_losses_per_game=risk_data.get("max_stop_losses_per_game", 0),
             max_loss_per_game_usdc=risk_data.get("max_loss_per_game_usdc", 0.0),
+            profit_cooldown_iterations=int(risk_data.get("profit_cooldown_iterations", 0)),
         )
 
         return StrategyConfig(
