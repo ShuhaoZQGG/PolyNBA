@@ -39,6 +39,7 @@ class ESPNClient:
 
     BASE_URL = "http://site.api.espn.com/apis/site/v2/sports/basketball/nba"
     SUMMARY_URL = "https://site.web.api.espn.com/apis/site/v2/sports/basketball/nba"
+    COMMON_V3_URL = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba"
 
     def __init__(
         self,
@@ -212,16 +213,50 @@ class ESPNClient:
         logger.debug("Fetching NBA injuries")
         return await self._request(url)
 
+    async def get_athlete_overview(self, athlete_id: str) -> dict[str, Any]:
+        """Get athlete overview with season stats.
+
+        Args:
+            athlete_id: ESPN athlete ID
+
+        Returns:
+            Athlete overview JSON data
+        """
+        url = f"{self.COMMON_V3_URL}/athletes/{athlete_id}/overview"
+
+        logger.debug(f"Fetching athlete overview for athlete_id: {athlete_id}")
+        return await self._request(url)
+
+    STANDINGS_URL = "http://site.api.espn.com/apis/v2/sports/basketball/nba"
+
     async def get_standings(self) -> dict[str, Any]:
         """Get NBA standings.
 
         Returns:
             Standings JSON data
         """
-        url = f"{self.BASE_URL}/standings"
+        url = f"{self.STANDINGS_URL}/standings"
 
         logger.debug("Fetching NBA standings")
         return await self._request(url)
+
+    async def get_team_schedule(self, team_id: str, season: Optional[int] = None) -> dict[str, Any]:
+        """Get team schedule (for head-to-head data).
+
+        Args:
+            team_id: ESPN team ID
+            season: Optional season year (e.g., 2026). Defaults to current season.
+
+        Returns:
+            Team schedule JSON data
+        """
+        url = f"{self.BASE_URL}/teams/{team_id}/schedule"
+        params = {"seasontype": "2"}  # Regular season
+        if season:
+            params["season"] = str(season)
+
+        logger.debug(f"Fetching team schedule for team_id: {team_id}")
+        return await self._request(url, params)
 
     async def get_play_by_play(self, game_id: str) -> dict[str, Any]:
         """Get play-by-play data for a game.

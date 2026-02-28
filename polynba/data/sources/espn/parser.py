@@ -1,6 +1,7 @@
 """Parser for ESPN API responses to data models."""
 
 import logging
+import re
 from datetime import datetime
 from typing import Any, Optional
 
@@ -9,6 +10,7 @@ from ...models import (
     GameState,
     GameStatus,
     GameSummary,
+    HeadToHead,
     Period,
     PlayEvent,
     PlayerInjury,
@@ -523,8 +525,12 @@ class ESPNParser:
         "day-to-day": "day-to-day",
         "day to day": "day-to-day",
         "dd": "day-to-day",
+        "injury_status_daytoday": "day-to-day",
         "probable": "probable",
         "p": "probable",
+        "suspension": "out",
+        "injury_status_suspension": "out",
+        "susp": "out",
     }
 
     # Fantasy status abbreviation map (separate from main statuses)
@@ -547,8 +553,9 @@ class ESPNParser:
         result: dict[str, list[PlayerInjury]] = {}
 
         for team_entry in data.get("injuries", []):
+            # ESPN returns team data either nested under "team" or at the top level
             team_info = team_entry.get("team", {})
-            team_id = team_info.get("id", "")
+            team_id = team_info.get("id", "") or str(team_entry.get("id", ""))
             if not team_id:
                 continue
 
@@ -579,6 +586,15 @@ class ESPNParser:
         athlete = injury_data.get("athlete", {})
         player_name = athlete.get("displayName", "")
         player_id = athlete.get("id", "")
+
+        # Fallback: extract ID from player link URL (/id/XXXXX/name)
+        if not player_id:
+            for link in athlete.get("links", []):
+                href = link.get("href", "")
+                m = re.search(r"/id/(\d+)/", href)
+                if m:
+                    player_id = m.group(1)
+                    break
 
         if not player_name:
             return None
@@ -628,6 +644,116 @@ class ESPNParser:
             injury_description=description,
         )
 
+    # Mapping from ESPN overview stat names to our field names
+    _OVERVIEW_STAT_MAP: dict[str, str] = {
+        "gamesPlayed": "games_played",
+        "avgMinutes": "minutes_per_game",
+        "fieldGoalPct": "field_goal_pct",
+        "threePointPct": "three_point_pct",
+        "threePointFieldGoalPct": "three_point_pct",  # alternate key
+        "freeThrowPct": "free_throw_pct",
+        "avgRebounds": "rebounds_per_game",
+        "avgAssists": "assists_per_game",
+        "avgBlocks": "blocks_per_game",
+        "avgSteals": "steals_per_game",
+        "avgFouls": "fouls_per_game",
+        "avgTurnovers": "turnovers_per_game",
+        "avgPoints": "points_per_game",
+    }
+
+    @staticmethod
+    def parse_athlete_overview(data: dict[str, Any]) -> Optional[dict[str, float]]:
+        """Parse ESPN athlete overview to extract season stats.
+
+        The names array lives at statistics.names (shared across all splits),
+        while each split has its own stats array. We find the Regular Season
+        split and zip its stats with the top-level names.
+
+        Args:
+            data: ESPN athlete overview JSON response
+
+        Returns:
+            Dict of stat_name -> value, or None if parsing fails
+        """
+        try:
+            statistics = data.get("statistics", {})
+            splits = statistics.get("splits", [])
+
+            # Names are at the statistics level, shared across splits
+            names = statistics.get("names", [])
+
+            # Find the Regular Season split
+            season_split = None
+            for split in splits:
+                if split.get("displayName") == "Regular Season":
+                    season_split = split
+                    break
+
+            # Fall back to first split if "Regular Season" not found
+            if season_split is None and splits:
+                season_split = splits[0]
+
+            if season_split is None:
+                return None
+
+            stats = season_split.get("stats", [])
+
+            # Fall back to split-level names if top-level names are empty
+            if not names:
+                names = season_split.get("names", [])
+
+            if not names or not stats or len(names) != len(stats):
+                return None
+
+            raw_map = dict(zip(names, stats))
+            result: dict[str, float] = {}
+
+            for espn_name, our_name in ESPNParser._OVERVIEW_STAT_MAP.items():
+                val = raw_map.get(espn_name)
+                if val is not None:
+                    try:
+                        result[our_name] = float(val)
+                    except (ValueError, TypeError):
+                        pass
+
+            return result if result else None
+
+        except Exception as e:
+            logger.warning(f"Failed to parse athlete overview: {e}")
+            return None
+
+    @staticmethod
+    def parse_team_roster(data: dict[str, Any]) -> list[dict[str, str]]:
+        """Parse ESPN team roster response to extract player info.
+
+        Args:
+            data: ESPN team roster JSON response (/teams/{id}/roster)
+
+        Returns:
+            List of dicts with athlete_id, player_name, position
+        """
+        players: list[dict[str, str]] = []
+
+        for entry in data.get("athletes", []):
+            # Handle both grouped format (items list) and flat format (direct athlete)
+            if "items" in entry:
+                athletes = entry["items"]
+            else:
+                athletes = [entry]
+
+            for athlete in athletes:
+                athlete_id = str(athlete.get("id", ""))
+                name = athlete.get("displayName", "") or athlete.get("fullName", "")
+                position = athlete.get("position", {}).get("abbreviation", "")
+                if athlete_id and name:
+                    players.append({
+                        "athlete_id": athlete_id,
+                        "player_name": name,
+                        "position": position,
+                    })
+
+        return players
+
     @staticmethod
     def parse_standings(data: dict[str, Any]) -> dict[str, dict[str, int]]:
         """Parse standings to get team rankings.
@@ -659,3 +785,98 @@ class ESPNParser:
                 }
 
         return rankings
+
+    @staticmethod
+    def parse_head_to_head(
+        schedule_data: dict[str, Any],
+        team_id: str,
+        opponent_id: str,
+    ) -> Optional[HeadToHead]:
+        """Parse team schedule to extract head-to-head record vs an opponent.
+
+        Args:
+            schedule_data: ESPN team schedule JSON response
+            team_id: The team whose schedule was fetched
+            opponent_id: The opponent team ID to filter for
+
+        Returns:
+            HeadToHead object or None if no completed games found
+        """
+        events = schedule_data.get("events", [])
+        if not events:
+            return None
+
+        team1_wins = 0
+        team2_wins = 0
+        team1_total_points = 0
+        team2_total_points = 0
+        games_played = 0
+        last_meeting_date: Optional[datetime] = None
+        last_meeting_winner: Optional[str] = None
+
+        for event in events:
+            # Only look at completed games
+            status = event.get("competitions", [{}])[0].get("status", {})
+            status_type = status.get("type", {})
+            if status_type.get("state", "") != "post":
+                continue
+
+            # Check if this game involves the opponent
+            competitors = event.get("competitions", [{}])[0].get("competitors", [])
+            if len(competitors) < 2:
+                continue
+
+            opponent_found = False
+            team_data = None
+            opp_data = None
+
+            for comp in competitors:
+                comp_id = comp.get("team", {}).get("id", "")
+                if comp_id == opponent_id:
+                    opponent_found = True
+                    opp_data = comp
+                elif comp_id == team_id:
+                    team_data = comp
+
+            if not opponent_found or not team_data or not opp_data:
+                continue
+
+            # This is a completed H2H game
+            games_played += 1
+            team_score = int(team_data.get("score", {}).get("value", 0) if isinstance(team_data.get("score"), dict) else team_data.get("score", 0))
+            opp_score = int(opp_data.get("score", {}).get("value", 0) if isinstance(opp_data.get("score"), dict) else opp_data.get("score", 0))
+
+            team1_total_points += team_score
+            team2_total_points += opp_score
+
+            if team_data.get("winner", False):
+                team1_wins += 1
+            else:
+                team2_wins += 1
+
+            # Track last meeting
+            date_str = event.get("date")
+            if date_str:
+                try:
+                    game_date = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                    if last_meeting_date is None or game_date > last_meeting_date:
+                        last_meeting_date = game_date
+                        last_meeting_winner = team_id if team_data.get("winner", False) else opponent_id
+                except ValueError:
+                    pass
+
+        if games_played == 0:
+            return None
+
+        return HeadToHead(
+            team1_id=team_id,
+            team2_id=opponent_id,
+            team1_wins=team1_wins,
+            team2_wins=team2_wins,
+            team1_avg_points=team1_total_points / games_played,
+            team2_avg_points=team2_total_points / games_played,
+            team1_avg_margin=(team1_total_points - team2_total_points) / games_played,
+            games_played=games_played,
+            last_meeting_date=last_meeting_date,
+            last_meeting_winner=last_meeting_winner,
+        )

@@ -10,7 +10,7 @@ from .enums import (
     TradeSide,
 )
 from .game_state import GameState, GameSummary, PlayEvent, TeamGameState
-from .team_stats import HeadToHead, PlayerInjury, TeamContext, TeamStats
+from .team_stats import HeadToHead, PlayerInjury, PlayerSeasonStats, TeamContext, TeamStats
 
 __all__ = [
     # Enums
@@ -29,6 +29,7 @@ __all__ = [
     # Team Stats
     "HeadToHead",
     "PlayerInjury",
+    "PlayerSeasonStats",
     "TeamContext",
     "TeamStats",
 ]
