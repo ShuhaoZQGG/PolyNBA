@@ -1,16 +1,23 @@
-"""API validation script — tests all external API integrations and parsing.
+"""Basketball API validation script — tests ESPN and NBA.com API integrations and parsing.
 
 Run with: cd /Users/shuhaozhang/Project/PolyNBA && .venv/bin/python -m polynba.tests.validate_apis
+
+For Polymarket validation, see: polynba.tests.validate_polymarket
 """
 
 import asyncio
-import json
 import logging
 import sys
 import traceback
 from datetime import datetime, timedelta
-from decimal import Decimal
-from typing import Any
+
+from polynba.tests.validation_helpers import (
+    ValidationResult,
+    header,
+    report,
+    section,
+    summary,
+)
 
 # ── Configure logging ────────────────────────────────────────────────
 logging.basicConfig(
@@ -19,52 +26,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("validate_apis")
 logger.setLevel(logging.INFO)
-
-
-# ── Helpers ──────────────────────────────────────────────────────────
-class ValidationResult:
-    """Tracks pass/fail/skip for a single check."""
-
-    def __init__(self, name: str):
-        self.name = name
-        self.passed: list[str] = []
-        self.failed: list[str] = []
-        self.warnings: list[str] = []
-
-    def ok(self, msg: str) -> None:
-        self.passed.append(msg)
-
-    def fail(self, msg: str) -> None:
-        self.failed.append(msg)
-
-    def warn(self, msg: str) -> None:
-        self.warnings.append(msg)
-
-    @property
-    def success(self) -> bool:
-        return len(self.failed) == 0
-
-
-def header(title: str) -> None:
-    print(f"\n{'=' * 64}")
-    print(f"  {title}")
-    print(f"{'=' * 64}")
-
-
-def section(title: str) -> None:
-    print(f"\n--- {title} ---")
-
-
-def report(vr: ValidationResult) -> None:
-    status = "PASS" if vr.success else "FAIL"
-    icon = "[OK]" if vr.success else "[FAIL]"
-    print(f"\n{icon} {vr.name}: {status}")
-    for msg in vr.passed:
-        print(f"    + {msg}")
-    for msg in vr.warnings:
-        print(f"    ? {msg}")
-    for msg in vr.failed:
-        print(f"    X {msg}")
 
 
 # ── ESPN API Validation ──────────────────────────────────────────────
@@ -521,6 +482,83 @@ async def validate_nba_player_index() -> ValidationResult:
     return vr
 
 
+async def validate_nba_team_advanced_stats() -> ValidationResult:
+    """Validate NBA.com team advanced stats endpoint and parsing."""
+    from polynba.data.sources.nba.client import NBAClient
+    from polynba.data.sources.nba.parser import NBAParser
+
+    vr = ValidationResult("NBA.com Team Advanced Stats")
+    client = NBAClient()
+
+    try:
+        raw = await client.get_advanced_team_stats()
+
+        result_sets = raw.get("resultSets", [])
+        if not result_sets:
+            vr.fail("Response missing 'resultSets'")
+            return vr
+        vr.ok(f"Raw response has {len(result_sets)} resultSets")
+
+        headers = result_sets[0].get("headers", [])
+        rows = result_sets[0].get("rowSet", [])
+        vr.ok(f"Headers: {len(headers)} columns, Rows: {len(rows)} teams")
+
+        if len(rows) < 28:
+            vr.fail(f"Expected 28+ teams, got {len(rows)}")
+        else:
+            vr.ok(f"Team count plausible ({len(rows)} >= 28)")
+
+        # Check key columns exist
+        for col in ["TEAM_NAME", "OFF_RATING", "DEF_RATING", "NET_RATING",
+                     "EFG_PCT", "TS_PCT", "AST_PCT", "PIE", "PACE"]:
+            if col in headers:
+                vr.ok(f"Column '{col}' present")
+            else:
+                vr.fail(f"Column '{col}' missing")
+
+        # Parse
+        parsed = NBAParser.parse_advanced_team_stats(raw)
+        vr.ok(f"Parsed advanced stats for {len(parsed)} teams")
+
+        if len(parsed) >= 28:
+            vr.ok(f"Parsed team count plausible ({len(parsed)} >= 28)")
+        else:
+            vr.fail(f"Only {len(parsed)} teams parsed (expected ~30)")
+
+        # Validate sample team
+        if "LAL" in parsed:
+            lal = parsed["LAL"]
+            ortg = lal.get("offensive_rating", 0)
+            drtg = lal.get("defensive_rating", 0)
+            pie = lal.get("team_pie", 0)
+            ortg_rank = lal.get("offensive_rating_rank", 0)
+            if 90 <= ortg <= 130:
+                vr.ok(f"LAL ORtg: {ortg:.1f} (plausible range)")
+            else:
+                vr.fail(f"LAL ORtg: {ortg:.1f} (out of 90-130 range)")
+            if 90 <= drtg <= 130:
+                vr.ok(f"LAL DRtg: {drtg:.1f} (plausible range)")
+            else:
+                vr.fail(f"LAL DRtg: {drtg:.1f} (out of 90-130 range)")
+            if 0 < pie < 1:
+                vr.ok(f"LAL PIE: {pie:.3f} (plausible fraction)")
+            else:
+                vr.warn(f"LAL PIE: {pie} (unexpected)")
+            if 1 <= ortg_rank <= 30:
+                vr.ok(f"LAL ORtg rank: #{ortg_rank} (valid 1-30)")
+            else:
+                vr.warn(f"LAL ORtg rank: {ortg_rank} (expected 1-30)")
+        else:
+            vr.fail("LAL not found in parsed results")
+
+    except Exception as e:
+        vr.fail(f"Exception: {e}\n{traceback.format_exc()}")
+    finally:
+        await client.close()
+
+    return vr
+
+
 async def validate_espn_athlete_overview() -> ValidationResult:
     """Validate ESPN athlete overview endpoint for extended player stats."""
     from polynba.data.sources.espn.client import ESPNClient
@@ -604,148 +642,6 @@ async def validate_espn_athlete_overview() -> ValidationResult:
     return vr
 
 
-# ── Polymarket Validation ────────────────────────────────────────────
-async def validate_polymarket_discovery() -> ValidationResult:
-    """Validate Polymarket Gamma API market discovery."""
-    from polynba.polymarket.market_discovery import MarketDiscovery
-
-    vr = ValidationResult("Polymarket Market Discovery (Gamma API)")
-    discovery = MarketDiscovery()
-
-    try:
-        markets = await discovery.discover_nba_markets(force_refresh=True)
-        vr.ok(f"Discovered {len(markets)} NBA moneyline markets")
-
-        if not markets:
-            vr.warn("No NBA markets found (may be offseason or no upcoming games)")
-            return vr
-
-        # Validate market fields
-        m = markets[0]
-        if m.condition_id:
-            vr.ok(f"condition_id present: {m.condition_id[:30]}...")
-        else:
-            vr.fail("condition_id is empty")
-
-        if m.home_token_id and m.away_token_id:
-            vr.ok(f"Token IDs present (home: {m.home_token_id[:20]}..., away: {m.away_token_id[:20]}...)")
-        else:
-            vr.fail("Token IDs missing")
-
-        if m.home_team_name and m.away_team_name:
-            home_abbr = discovery.get_team_abbreviation(m.home_team_name) or "???"
-            away_abbr = discovery.get_team_abbreviation(m.away_team_name) or "???"
-            vr.ok(f"Teams: {m.away_team_name} ({away_abbr}) @ {m.home_team_name} ({home_abbr})")
-        else:
-            vr.fail("Team names missing")
-
-        if m.home_price is not None and m.away_price is not None:
-            hp, ap = float(m.home_price), float(m.away_price)
-            if 0 < hp < 1 and 0 < ap < 1:
-                vr.ok(f"Prices sane: home=${hp:.2f}, away=${ap:.2f} (sum={hp + ap:.2f})")
-            else:
-                vr.fail(f"Prices out of range: home={hp}, away={ap}")
-        else:
-            vr.warn("Prices are None (Gamma API may not include them)")
-
-        if m.end_date:
-            vr.ok(f"End date: {m.end_date.isoformat()}")
-        else:
-            vr.warn("End date is None")
-
-        vr.ok(f"Tradeable: {m.is_tradeable}, Volume: {m.volume}")
-
-        # Store for price fetcher test
-        vr._market = m
-
-        # Also list all markets
-        for i, mkt in enumerate(markets):
-            home_abbr = discovery.get_team_abbreviation(mkt.home_team_name) or "???"
-            away_abbr = discovery.get_team_abbreviation(mkt.away_team_name) or "???"
-            hp_str = f"${float(mkt.home_price):.2f}" if mkt.home_price else "N/A"
-            ap_str = f"${float(mkt.away_price):.2f}" if mkt.away_price else "N/A"
-            date_str = mkt.end_date.strftime("%m/%d") if mkt.end_date else "?"
-            print(f"    [{date_str}] {away_abbr} @ {home_abbr}: {home_abbr} {hp_str}, {away_abbr} {ap_str}")
-
-    except Exception as e:
-        vr.fail(f"Exception: {e}\n{traceback.format_exc()}")
-    finally:
-        await discovery.close()
-
-    return vr
-
-
-async def validate_polymarket_prices(market: Any) -> ValidationResult:
-    """Validate Polymarket CLOB price fetching and order book parsing."""
-    from polynba.polymarket.price_fetcher import PriceFetcher
-
-    vr = ValidationResult(f"Polymarket CLOB Prices ({market.home_team_name} vs {market.away_team_name})")
-    fetcher = PriceFetcher()
-
-    try:
-        prices = await fetcher.get_market_prices(market)
-
-        if prices is None:
-            vr.fail("get_market_prices returned None")
-            return vr
-        vr.ok("Fetched MarketPrices successfully")
-
-        # Validate mid prices
-        hm, am = float(prices.home_mid_price), float(prices.away_mid_price)
-        if 0 < hm < 1 and 0 < am < 1:
-            vr.ok(f"Mid prices: home={hm:.4f}, away={am:.4f}")
-        else:
-            vr.fail(f"Mid prices out of range: home={hm}, away={am}")
-
-        price_sum = hm + am
-        if 0.95 <= price_sum <= 1.05:
-            vr.ok(f"Price sum ~1.0: {price_sum:.4f}")
-        else:
-            vr.warn(f"Price sum deviates from 1.0: {price_sum:.4f}")
-
-        # Validate bid/ask
-        if prices.home_best_bid is not None and prices.home_best_ask is not None:
-            hb, ha = float(prices.home_best_bid), float(prices.home_best_ask)
-            if hb < ha:
-                vr.ok(f"Home bid/ask: {hb:.4f}/{ha:.4f} (spread={ha - hb:.4f})")
-            else:
-                vr.fail(f"Home bid >= ask: {hb} >= {ha}")
-        else:
-            vr.warn("Home bid/ask not available")
-
-        if prices.away_best_bid is not None and prices.away_best_ask is not None:
-            ab, aa = float(prices.away_best_bid), float(prices.away_best_ask)
-            if ab < aa:
-                vr.ok(f"Away bid/ask: {ab:.4f}/{aa:.4f} (spread={aa - ab:.4f})")
-            else:
-                vr.fail(f"Away bid >= ask: {ab} >= {aa}")
-        else:
-            vr.warn("Away bid/ask not available")
-
-        # Validate depth
-        hbd = float(prices.home_bid_depth)
-        vr.ok(f"Home bid depth: ${hbd:,.0f}, Has liquidity: {prices.has_liquidity}")
-
-        # Test get_token_sell_price
-        sell_price = fetcher.get_token_sell_price(market.home_token_id)
-        if sell_price is not None:
-            vr.ok(f"Home token sell price (best bid): {float(sell_price):.4f}")
-        else:
-            vr.warn("get_token_sell_price returned None")
-
-        # Test get_token_price_info
-        mid, bid, spread_pct = fetcher.get_token_price_info(market.home_token_id)
-        if mid is not None:
-            vr.ok(f"Home token info: mid={float(mid):.4f}, bid={float(bid):.4f}, spread={spread_pct:.2f}%")
-        else:
-            vr.warn("get_token_price_info returned None for mid")
-
-    except Exception as e:
-        vr.fail(f"Exception: {e}\n{traceback.format_exc()}")
-
-    return vr
-
-
 # ── Main ─────────────────────────────────────────────────────────────
 async def main() -> int:
     results: list[ValidationResult] = []
@@ -805,47 +701,18 @@ async def main() -> int:
     results.append(pi_result)
     report(pi_result)
 
-    section("2d. ESPN Athlete Overview (extended stats)")
+    section("2d. Team Advanced Stats")
+    team_adv_result = await validate_nba_team_advanced_stats()
+    results.append(team_adv_result)
+    report(team_adv_result)
+
+    section("2e. ESPN Athlete Overview (extended stats)")
     overview_result = await validate_espn_athlete_overview()
     results.append(overview_result)
     report(overview_result)
 
-    # ── Polymarket ──
-    header("3. Polymarket")
-
-    section("3a. Market Discovery (Gamma API)")
-    discovery_result = await validate_polymarket_discovery()
-    results.append(discovery_result)
-    report(discovery_result)
-
-    market = getattr(discovery_result, "_market", None)
-    if market:
-        section("3b. CLOB Price Fetching")
-        price_result = await validate_polymarket_prices(market)
-        results.append(price_result)
-        report(price_result)
-
     # ── Summary ──
-    header("SUMMARY")
-    total_pass = sum(1 for r in results if r.success)
-    total_fail = sum(1 for r in results if not r.success)
-    total_checks = sum(len(r.passed) for r in results)
-    total_failures = sum(len(r.failed) for r in results)
-    total_warnings = sum(len(r.warnings) for r in results)
-
-    print(f"\nSections:  {total_pass} passed, {total_fail} failed (of {len(results)} total)")
-    print(f"Checks:    {total_checks} passed, {total_failures} failed, {total_warnings} warnings")
-
-    for r in results:
-        icon = "[OK]  " if r.success else "[FAIL]"
-        print(f"  {icon} {r.name}")
-
-    if total_fail > 0:
-        print(f"\n{total_fail} SECTION(S) FAILED")
-        return 1
-    else:
-        print("\nALL SECTIONS PASSED")
-        return 0
+    return summary(results)
 
 
 if __name__ == "__main__":

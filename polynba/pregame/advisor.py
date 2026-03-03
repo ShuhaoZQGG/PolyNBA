@@ -15,10 +15,11 @@ import asyncio
 import logging
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from ..analysis.claude_analyzer import ClaudeAnalyzer, ClaudeAnalysisConfig
 from ..data.manager import DataManager
@@ -27,7 +28,26 @@ from ..polymarket.market_discovery import MarketDiscovery
 from ..polymarket.models import MarketPrices, PolymarketNBAMarket
 from ..polymarket.price_fetcher import PriceFetcher
 from .pregame_context import CONVICTION_PROMPT, EDGE_PROMPT, build_pregame_context
-from .probability_model import PreGameEstimate, PreGameModelConfig, PreGameProbabilityModel
+from .probability_model import PreGameEstimate, PreGameModelConfig, PreGameProbabilityModel, TradingPlan
+
+# ESPN uses non-standard abbreviations for some teams. Map them to the
+# canonical 3-letter codes used everywhere else (including NBA_TEAMS dict).
+_ESPN_ABBR_NORMALISE: dict[str, str] = {
+    "GS": "GSW",
+    "WSH": "WAS",
+    "NO": "NOP",
+    "UTAH": "UTA",
+    "NY": "NYK",
+    "SA": "SAS",
+    "PHO": "PHX",
+    "BKLYN": "BKN",
+    "BK": "BKN",
+}
+
+
+def _normalise_espn_abbr(abbr: str) -> str:
+    """Normalise an ESPN team abbreviation to the canonical 3-letter code."""
+    return _ESPN_ABBR_NORMALISE.get(abbr, abbr)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +65,7 @@ class GameAdvisory:
     market: PolymarketNBAMarket
     prices: MarketPrices
     estimate: PreGameEstimate
+    trading_plan: Optional[TradingPlan] = None
     ai_analysis: Optional[str] = None
 
 
@@ -88,6 +109,9 @@ class PreGameAdvisor:
         self._use_claude = use_claude
         self._show_hold = show_hold
         self._log_level = log_level
+        # Default to today in US/Eastern (NBA schedule dates are ET-based)
+        if scan_date is None:
+            scan_date = datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d")
         self._scan_date = scan_date
         self._model = PreGameProbabilityModel(self._model_config)
         self._claude: Optional[ClaudeAnalyzer] = None
@@ -233,11 +257,13 @@ class PreGameAdvisor:
                 market_away_abbr = market_discovery.get_team_abbreviation(
                     market.away_team_name
                 )
+                game_home = _normalise_espn_abbr(game.home_team_abbreviation)
+                game_away = _normalise_espn_abbr(game.away_team_abbreviation)
                 if (
                     market_home_abbr is not None
                     and market_away_abbr is not None
-                    and game.home_team_abbreviation == market_home_abbr
-                    and game.away_team_abbreviation == market_away_abbr
+                    and game_home == market_home_abbr
+                    and game_away == market_away_abbr
                 ):
                     matched[game.game_id] = (game, market)
                     logger.debug(
@@ -266,14 +292,13 @@ class PreGameAdvisor:
         advisories: list[GameAdvisory] = []
 
         for game_id, (game, market) in matched.items():
-            advisory = await self._process_game(
+            game_advisories = await self._process_game(
                 game=game,
                 market=market,
                 data_manager=data_manager,
                 price_fetcher=price_fetcher,
             )
-            if advisory is not None:
-                advisories.append(advisory)
+            advisories.extend(game_advisories)
 
         # ----------------------------------------------------------------
         # 5. Sort by absolute edge descending
@@ -309,10 +334,11 @@ class PreGameAdvisor:
         market: PolymarketNBAMarket,
         data_manager: DataManager,
         price_fetcher: PriceFetcher,
-    ) -> Optional[GameAdvisory]:
-        """Fetch all data for one matched game and produce a GameAdvisory.
+    ) -> list[GameAdvisory]:
+        """Fetch all data for one matched game and produce GameAdvisories.
 
-        Returns None if any critical data is missing.
+        Returns a list of 0–2 advisories: the primary edge-based advisory
+        and optionally a conviction RESOLUTION advisory for the opposite side.
         """
         home_abbr = game.home_team_abbreviation
         away_abbr = game.away_team_abbreviation
@@ -323,7 +349,7 @@ class PreGameAdvisor:
         prices = await price_fetcher.get_market_prices(market)
         if prices is None:
             logger.warning("No prices available for %s — skipping.", label)
-            return None
+            return []
 
         # Market's implied home-win probability (mid-price is already 0-1)
         market_home_prob = float(prices.home_mid_price)
@@ -344,13 +370,13 @@ class PreGameAdvisor:
                 "No home team context for %s (team_id=%s) — skipping.",
                 label, game.home_team_id,
             )
-            return None
+            return []
         if away_ctx is None:
             logger.warning(
                 "No away team context for %s (team_id=%s) — skipping.",
                 label, game.away_team_id,
             )
-            return None
+            return []
 
         # ---- Head-to-head ----
         h2h: Optional[HeadToHead] = None
@@ -392,7 +418,7 @@ class PreGameAdvisor:
                 label, exc,
                 exc_info=True,
             )
-            return None
+            return []
 
         logger.info(
             "%s — model: %.1f%%, market: %.1f%%, edge: %+.1f%%, verdict: %s",
@@ -411,13 +437,27 @@ class PreGameAdvisor:
             )
         # Future: BET verdicts could use EDGE_PROMPT here
 
-        return GameAdvisory(
+        # ---- Trading plan ----
+        trading_plan = self._compute_trading_plan(estimate, prices, market)
+
+        primary = GameAdvisory(
             game=game,
             market=market,
             prices=prices,
             estimate=estimate,
+            trading_plan=trading_plan,
             ai_analysis=ai_analysis,
         )
+        advisories = [primary]
+
+        # ---- Conviction RESOLUTION for opposite side ----
+        conviction = self._build_conviction_advisory(
+            game, market, prices, estimate,
+        )
+        if conviction is not None:
+            advisories.append(conviction)
+
+        return advisories
 
     # ------------------------------------------------------------------
     # Claude AI conviction analysis
@@ -546,6 +586,219 @@ class PreGameAdvisor:
         return "\n".join(parts)
 
     # ------------------------------------------------------------------
+    # Conviction RESOLUTION advisory
+    # ------------------------------------------------------------------
+
+    def _build_conviction_advisory(
+        self,
+        game: GameSummary,
+        market: PolymarketNBAMarket,
+        prices: MarketPrices,
+        estimate: PreGameEstimate,
+    ) -> Optional[GameAdvisory]:
+        """Build a conviction RESOLUTION advisory for the opposite side.
+
+        When both model and market strongly favor one team (both >= hold_threshold),
+        generate a second advisory to hold that favorite to resolution, even if the
+        edge-based trade is on the underdog.
+        """
+        cfg = self._model_config
+        threshold = cfg.hold_threshold
+
+        # Check each side for dual conviction
+        home_model = estimate.model_prob
+        home_market = estimate.market_prob
+        away_model = 1.0 - estimate.model_prob
+        away_market = 1.0 - estimate.market_prob
+
+        conviction_side: Optional[str] = None
+        conviction_model_prob = 0.0
+        conviction_market_prob = 0.0
+
+        if home_model >= threshold and home_market >= threshold:
+            conviction_side = "home"
+            conviction_model_prob = home_model
+            conviction_market_prob = home_market
+        elif away_model >= threshold and away_market >= threshold:
+            conviction_side = "away"
+            conviction_model_prob = away_model
+            conviction_market_prob = away_market
+
+        if conviction_side is None:
+            return None
+
+        # Skip if edge-based verdict already bets on this side
+        if estimate.bet_side == conviction_side:
+            return None
+
+        label = f"{game.away_team_abbreviation} @ {game.home_team_abbreviation}"
+        side_label = "HOME" if conviction_side == "home" else "AWAY"
+
+        # Kelly sizing: model_prob vs market_prob (SPECULATE-style)
+        market_safe = max(1e-6, min(1.0 - 1e-6, conviction_market_prob))
+        odds = (1.0 / market_safe) - 1.0
+        q = 1.0 - conviction_model_prob
+        kelly_raw = (odds * conviction_model_prob - q) / odds
+        kelly = max(0.0, kelly_raw) * cfg.speculate_kelly_fraction
+        kelly = min(kelly, cfg.max_kelly_pct / 100.0)
+
+        # Floor: if Kelly <= 0 (model says slightly overpriced), use 1.5%
+        if kelly <= 0:
+            kelly = 0.015
+
+        suggested_bet = kelly * self._bankroll
+
+        logger.info(
+            "Conviction RESOLUTION for %s: %s side (model=%.1f%%, market=%.1f%%), kelly=%.2f%%",
+            label, side_label,
+            conviction_model_prob * 100, conviction_market_prob * 100,
+            kelly * 100,
+        )
+
+        # Build conviction estimate (override verdict/bet_side/kelly)
+        conviction_estimate = replace(
+            estimate,
+            verdict=f"BET {side_label}",
+            bet_side=conviction_side,
+            kelly_fraction=kelly,
+            suggested_bet_usdc=suggested_bet,
+        )
+
+        # Compute trading plan — will naturally get RESOLUTION since bet_side_prob >= threshold
+        trading_plan = self._compute_trading_plan(conviction_estimate, prices, market)
+
+        return GameAdvisory(
+            game=game,
+            market=market,
+            prices=prices,
+            estimate=conviction_estimate,
+            trading_plan=trading_plan,
+        )
+
+    # ------------------------------------------------------------------
+    # Trading plan computation
+    # ------------------------------------------------------------------
+
+    def _compute_trading_plan(
+        self,
+        estimate: PreGameEstimate,
+        prices: MarketPrices,
+        market: PolymarketNBAMarket,
+    ) -> Optional[TradingPlan]:
+        """Compute smart entry/exit pricing for a bet recommendation.
+
+        Returns None for HOLD verdicts or when market data is insufficient.
+        """
+        if estimate.verdict == "HOLD":
+            return None
+
+        cfg = self._model_config
+
+        # ---- Get bet-side order book data ----
+        if estimate.bet_side == "home":
+            best_bid = prices.home_best_bid
+            best_ask = prices.home_best_ask
+            spread_dec = prices.home_spread
+            ask_depth = float(prices.home_ask_depth)
+        else:
+            best_bid = prices.away_best_bid
+            best_ask = prices.away_best_ask
+            spread_dec = prices.away_spread
+            ask_depth = float(prices.away_ask_depth)
+
+        # ---- Bet-side model probability ----
+        if estimate.bet_side == "home":
+            bet_side_prob = estimate.blended_prob
+        else:
+            bet_side_prob = 1.0 - estimate.blended_prob
+
+        # ---- Fair value for bet side ----
+        fair_value = bet_side_prob
+
+        # ---- Handle missing bid/ask: fall back to best_ask ----
+        if best_bid is None or best_ask is None:
+            if best_ask is not None:
+                entry_price = float(best_ask)
+            else:
+                return None
+            return TradingPlan(
+                strategy="RESOLUTION" if bet_side_prob >= cfg.hold_threshold else "TRADE",
+                entry_price=entry_price,
+                exit_price=None,
+                expected_roi=(bet_side_prob * 1.0 - entry_price) / entry_price if entry_price > 0 else 0.0,
+                bet_side_prob=bet_side_prob,
+                spread=None,
+                spread_pct=None,
+                depth_available=ask_depth,
+                liquidity_warning=True,
+            )
+
+        bid = float(best_bid)
+        ask = float(best_ask)
+        spread = float(spread_dec) if spread_dec is not None else ask - bid
+        mid = (bid + ask) / 2.0
+        spread_pct = (spread / mid * 100.0) if mid > 0 else 0.0
+
+        # ---- Determine strategy ----
+        is_speculate = estimate.verdict.startswith("SPECULATE")
+        if is_speculate:
+            strategy = "RESOLUTION"
+        elif bet_side_prob >= cfg.hold_threshold:
+            strategy = "RESOLUTION"
+        else:
+            strategy = "TRADE"
+
+        # ---- Compute entry aggression ----
+        effective_aggression = cfg.base_entry_aggression
+        if strategy == "RESOLUTION":
+            effective_aggression -= 0.15
+        elif strategy == "TRADE" and abs(estimate.edge_percent) > 5.0:
+            effective_aggression += 0.15
+        effective_aggression = max(0.0, min(1.0, effective_aggression))
+
+        # ---- Entry price ----
+        raw_entry = bid + spread * effective_aggression
+        entry_price = math.floor(raw_entry * 100) / 100  # Floor to 1¢ tick
+
+        # ---- Liquidity warning ----
+        liquidity_warning = spread > cfg.max_spread
+
+        # ---- Guard: entry >= fair_value → fall back to best_ask ----
+        if entry_price >= fair_value:
+            entry_price = ask
+
+        # ---- Exit price (TRADE only) ----
+        exit_price: Optional[float] = None
+        if strategy == "TRADE":
+            raw_exit = entry_price + (fair_value - entry_price) * cfg.exit_edge_capture
+            exit_price = math.ceil(raw_exit * 100) / 100  # Ceil to 1¢ tick
+
+            # Guard: min profit of $0.02
+            if exit_price - entry_price < 0.02:
+                exit_price = None  # Too thin to trade profitably
+
+        # ---- Expected ROI ----
+        if strategy == "RESOLUTION":
+            expected_roi = (bet_side_prob * 1.0 - entry_price) / entry_price if entry_price > 0 else 0.0
+        else:
+            if exit_price is not None and entry_price > 0:
+                expected_roi = (exit_price - entry_price) / entry_price
+            else:
+                expected_roi = (fair_value - entry_price) / entry_price if entry_price > 0 else 0.0
+
+        return TradingPlan(
+            strategy=strategy,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            expected_roi=expected_roi,
+            bet_side_prob=bet_side_prob,
+            spread=spread,
+            spread_pct=spread_pct,
+            depth_available=ask_depth,
+            liquidity_warning=liquidity_warning,
+        )
+
+    # ------------------------------------------------------------------
     # Output formatting
     # ------------------------------------------------------------------
 
@@ -574,28 +827,42 @@ class PreGameAdvisor:
         print()
         header = (
             f"{'#':>2}  {'Game':<18} {'Model':>6}  {'Market':>6}  "
-            f"{'Edge':>6}  {'Kelly':>6}  {'Bet':>6}  {'Conf':>5}  {'Verdict'}"
+            f"{'Edge':>6}  {'Buy':>8}  {'Sell':>14}  {'Bet':>6}  "
+            f"{'E[ROI]':>7}  {'Conf':>5}  {'Verdict'}"
         )
         print(header)
-        print("-" * 78)
+        print("-" * 105)
 
         for idx, adv in enumerate(advisories, start=1):
             game = adv.game
             est = adv.estimate
+            tp = adv.trading_plan
             game_label = f"{game.away_team_abbreviation} @ {game.home_team_abbreviation}"
 
-            # Edge: always show from the home perspective for consistency.
             edge_sign = f"{est.edge_percent:+.1f}%"
-            kelly_pct = f"{est.kelly_fraction:.1%}"
             bet_str = f"${est.suggested_bet_usdc:.0f}"
             conf_str = f"{est.confidence}/10"
             model_str = f"{est.model_prob:.1%}"
             market_str = f"{est.market_prob:.1%}"
 
+            if tp is not None:
+                buy_str = f"${tp.entry_price:.2f}"
+                if tp.strategy == "RESOLUTION":
+                    sell_str = "HOLD→$1.00"
+                elif tp.exit_price is not None:
+                    sell_str = f"${tp.exit_price:.2f}"
+                else:
+                    sell_str = "-"
+                roi_str = f"{tp.expected_roi:+.1%}"
+            else:
+                buy_str = "-"
+                sell_str = "-"
+                roi_str = "-"
+
             print(
                 f"{idx:>2}  {game_label:<18} {model_str:>6}  {market_str:>6}  "
-                f"{edge_sign:>6}  {kelly_pct:>6}  {bet_str:>6}  {conf_str:>5}  "
-                f"{est.verdict}"
+                f"{edge_sign:>6}  {buy_str:>8}  {sell_str:>14}  {bet_str:>6}  "
+                f"{roi_str:>7}  {conf_str:>5}  {est.verdict}"
             )
 
         print()
@@ -604,6 +871,7 @@ class PreGameAdvisor:
         for adv in advisories:
             game = adv.game
             est = adv.estimate
+            tp = adv.trading_plan
             away_abbr = game.away_team_abbreviation
             home_abbr = game.home_team_abbreviation
 
@@ -617,13 +885,55 @@ class PreGameAdvisor:
             print(
                 f"  Model: {est.model_prob:.1%} | "
                 f"Market: {est.market_prob:.1%} | "
-                f"Edge: {est.edge_percent:+.1%}"
+                f"Edge: {est.edge_percent:+.1f}%"
             )
-            print(
-                f"  Kelly: {est.kelly_fraction:.1%} | "
-                f"Bet: ${est.suggested_bet_usdc:.2f} on {bet_side_team} | "
-                f"Confidence: {est.confidence}/10"
-            )
+
+            if tp is not None:
+                print(
+                    f"  Strategy: {tp.strategy} | Expected ROI: {tp.expected_roi:+.1%}"
+                )
+                # Entry line
+                bid_str = f"${tp.entry_price:.2f}"
+                if tp.spread is not None:
+                    best_bid = tp.entry_price  # approximate for display
+                    best_ask = tp.entry_price + tp.spread if tp.spread else tp.entry_price
+                    # Use actual order book data
+                    if est.bet_side == "home":
+                        b_bid = f"${float(adv.prices.home_best_bid):.2f}" if adv.prices.home_best_bid else "?"
+                        b_ask = f"${float(adv.prices.home_best_ask):.2f}" if adv.prices.home_best_ask else "?"
+                    else:
+                        b_bid = f"${float(adv.prices.away_best_bid):.2f}" if adv.prices.away_best_bid else "?"
+                        b_ask = f"${float(adv.prices.away_best_ask):.2f}" if adv.prices.away_best_ask else "?"
+                    spread_str = f"{tp.spread_pct:.1f}%" if tp.spread_pct is not None else "?"
+                    print(
+                        f"  Entry: Limit buy at ${tp.entry_price:.2f} "
+                        f"(bid {b_bid}, ask {b_ask}, spread {spread_str})"
+                    )
+                else:
+                    print(f"  Entry: Limit buy at ${tp.entry_price:.2f} (fallback to ask)")
+
+                # Exit line
+                if tp.strategy == "RESOLUTION":
+                    print(
+                        f"  Exit: Hold to game resolution → $1.00 payout if {bet_side_team} wins"
+                    )
+                elif tp.exit_price is not None:
+                    capture_pct = int(self._model_config.exit_edge_capture * 100)
+                    print(
+                        f"  Exit: Target sell at ${tp.exit_price:.2f} "
+                        f"(fair value ${tp.bet_side_prob:.2f}, capturing {capture_pct}%)"
+                    )
+                else:
+                    print("  Exit: Spread too thin for profitable trade — consider hold to resolution")
+
+                if tp.liquidity_warning:
+                    print(f"  ⚠ Liquidity warning: spread ({tp.spread:.2f}) exceeds max ({self._model_config.max_spread})")
+            else:
+                print(
+                    f"  Kelly: {est.kelly_fraction:.1%} | "
+                    f"Bet: ${est.suggested_bet_usdc:.2f} on {bet_side_team} | "
+                    f"Confidence: {est.confidence}/10"
+                )
             print()
 
             if est.factors_summary:
@@ -641,9 +951,18 @@ class PreGameAdvisor:
 
             # Execution command for BET and SPECULATE recommendations
             if est.verdict.startswith("BET") or est.verdict.startswith("SPECULATE"):
-                cmd = self._build_execute_command(adv)
-                if cmd:
-                    print(f"  Execute: {cmd}")
+                buy_cmd = self._build_execute_command(adv)
+                if buy_cmd:
+                    if tp is not None and tp.strategy == "TRADE":
+                        print(f"  Execute (BUY): {buy_cmd}")
+                    else:
+                        print(f"  Execute: {buy_cmd}")
+
+                    # TRADE exit command
+                    if tp is not None and tp.strategy == "TRADE" and tp.exit_price is not None:
+                        sell_cmd = self._build_exit_command(adv)
+                        if sell_cmd:
+                            print(f"  Exit target:   {sell_cmd}")
                     print()
 
     def _build_execute_command(self, adv: GameAdvisory) -> str | None:
@@ -651,8 +970,9 @@ class PreGameAdvisor:
         est = adv.estimate
         market = adv.market
         prices = adv.prices
+        tp = adv.trading_plan
 
-        # Pick the token ID and best ask for the bet side
+        # Pick the token ID for the bet side
         if est.bet_side == "home":
             token_id = market.home_token_id
             best_ask = prices.home_best_ask
@@ -660,10 +980,14 @@ class PreGameAdvisor:
             token_id = market.away_token_id
             best_ask = prices.away_best_ask
 
-        if best_ask is None:
+        # Use trading plan entry price if available, otherwise fall back to best_ask
+        if tp is not None:
+            price = tp.entry_price
+        elif best_ask is not None:
+            price = float(best_ask)
+        else:
             return None
 
-        price = float(best_ask)
         size_usdc = est.suggested_bet_usdc
 
         return (
@@ -673,4 +997,31 @@ class PreGameAdvisor:
             f" --side buy"
             f" --size {size_usdc:.2f}"
             f" --price {price}"
+        )
+
+    def _build_exit_command(self, adv: GameAdvisory) -> str | None:
+        """Build the CLI command string for a TRADE exit (sell) order."""
+        est = adv.estimate
+        market = adv.market
+        tp = adv.trading_plan
+
+        if tp is None or tp.exit_price is None:
+            return None
+
+        if est.bet_side == "home":
+            token_id = market.home_token_id
+        else:
+            token_id = market.away_token_id
+
+        # Sell size = number of shares bought = size_usdc / entry_price
+        shares = est.suggested_bet_usdc / tp.entry_price if tp.entry_price > 0 else 0
+        shares = math.floor(shares * 100) / 100  # Floor to 2 decimal places
+
+        return (
+            f"python -m polynba.pregame.execute"
+            f" --token-id {token_id}"
+            f" --market-id {market.condition_id}"
+            f" --side sell"
+            f" --size {shares:.2f}"
+            f" --price {tp.exit_price}"
         )

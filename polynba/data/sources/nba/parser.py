@@ -5,6 +5,7 @@ import unicodedata
 from datetime import datetime
 from typing import Any, Optional
 
+from ...espn_teams import TEAM_NAMES
 from ...models import (
     EventType,
     GameState,
@@ -17,6 +18,47 @@ from ...models import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Reverse lookup: full team name -> abbreviation (e.g. "Atlanta Hawks" -> "ATL")
+_TEAM_NAME_TO_ABBR: dict[str, str] = {name: abbr for abbr, name in TEAM_NAMES.items()}
+
+# Mapping from API column names to TeamStats field names
+_TEAM_ADVANCED_FIELD_MAP: dict[str, str] = {
+    "OFF_RATING": "offensive_rating",
+    "DEF_RATING": "defensive_rating",
+    "NET_RATING": "net_rating",
+    "AST_PCT": "assist_pct",
+    "AST_TO": "assist_to_turnover",
+    "AST_RATIO": "assist_ratio",
+    "OREB_PCT": "offensive_rebound_pct",
+    "DREB_PCT": "defensive_rebound_pct",
+    "REB_PCT": "rebound_percentage",
+    "EFG_PCT": "effective_field_goal_percentage",
+    "TS_PCT": "true_shooting_percentage",
+    "TM_TOV_PCT": "turnover_pct",
+    "PACE": "pace",
+    "PIE": "team_pie",
+    "E_OFF_RATING": "estimated_offensive_rating",
+    "E_DEF_RATING": "estimated_defensive_rating",
+    "E_NET_RATING": "estimated_net_rating",
+    "POSS": "possessions",
+    "MIN": "minutes",
+}
+
+# Mapping from rank columns to TeamStats rank field names
+_TEAM_RANK_FIELD_MAP: dict[str, str] = {
+    "OFF_RATING_RANK": "offensive_rating_rank",
+    "DEF_RATING_RANK": "defensive_rating_rank",
+    "NET_RATING_RANK": "net_rating_rank",
+    "EFG_PCT_RANK": "effective_fg_pct_rank",
+    "TS_PCT_RANK": "true_shooting_pct_rank",
+    "AST_PCT_RANK": "assist_pct_rank",
+    "AST_TO_RANK": "assist_to_turnover_rank",
+    "REB_PCT_RANK": "rebound_pct_rank",
+    "TM_TOV_PCT_RANK": "turnover_pct_rank",
+    "PIE_RANK": "pie_rank",
+    "PACE_RANK": "pace_rank",
+}
 
 # Mapping from API column names to PlayerSeasonStats field names
 _ADVANCED_FIELD_MAP: dict[str, str] = {
@@ -294,6 +336,73 @@ class NBAParser:
 
         except Exception as e:
             logger.error(f"Failed to parse base player stats: {e}")
+
+        return result
+
+    @staticmethod
+    def parse_advanced_team_stats(data: dict[str, Any]) -> dict[str, dict[str, float]]:
+        """Parse leaguedashteamstats Advanced response to per-team stat dicts.
+
+        The response has TEAM_ID and TEAM_NAME but no TEAM_ABBREVIATION,
+        so we build a reverse lookup from TEAM_NAMES to map names to abbreviations.
+
+        Args:
+            data: stats.nba.com leaguedashteamstats response
+
+        Returns:
+            Dictionary keyed by team abbreviation -> {field_name: value}
+        """
+        result: dict[str, dict[str, float]] = {}
+
+        try:
+            result_set = data.get("resultSets", [{}])[0]
+            headers = result_set.get("headers", [])
+            rows = result_set.get("rowSet", [])
+
+            if not headers or not rows:
+                logger.warning("Team advanced stats has no headers or rows")
+                return result
+
+            idx = {h: i for i, h in enumerate(headers)}
+
+            name_idx = idx.get("TEAM_NAME")
+            if name_idx is None:
+                logger.warning("Team advanced stats missing TEAM_NAME column")
+                return result
+
+            for row in rows:
+                try:
+                    team_name = row[name_idx]
+                    if not team_name:
+                        continue
+
+                    # Reverse lookup: full name -> abbreviation
+                    abbr = _TEAM_NAME_TO_ABBR.get(team_name)
+                    if not abbr:
+                        logger.debug(f"Unknown team name in advanced stats: {team_name}")
+                        continue
+
+                    stats: dict[str, float] = {}
+
+                    # Stat values
+                    for api_col, field_name in _TEAM_ADVANCED_FIELD_MAP.items():
+                        col_idx = idx.get(api_col)
+                        if col_idx is not None and row[col_idx] is not None:
+                            stats[field_name] = float(row[col_idx])
+
+                    # Rank values
+                    for api_col, field_name in _TEAM_RANK_FIELD_MAP.items():
+                        col_idx = idx.get(api_col)
+                        if col_idx is not None and row[col_idx] is not None:
+                            stats[field_name] = int(row[col_idx])
+
+                    result[abbr] = stats
+
+                except (IndexError, TypeError, ValueError) as e:
+                    logger.debug(f"Failed to parse team advanced stats row: {e}")
+
+        except Exception as e:
+            logger.error(f"Failed to parse advanced team stats: {e}")
 
         return result
 

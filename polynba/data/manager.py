@@ -7,6 +7,7 @@ from typing import Optional
 
 from .cache import CacheConfig, DataCache, cached
 from .failover import DataSource, FailoverManager
+from .espn_teams import ESPN_IDS, ESPN_TEAMS
 from .models import GameState, GameSummary, HeadToHead, PlayerInjury, PlayerSeasonStats, TeamContext, TeamStats
 from .sources.espn.client import ESPNClient, ESPNClientError
 from .sources.espn.parser import ESPNParser
@@ -132,6 +133,9 @@ class DataManager:
     ) -> Optional[TeamStats]:
         """Get team statistics.
 
+        Fetches base stats from ESPN via failover, then overlays NBA.com
+        advanced team stats (ORtg, DRtg, eFG%, TS%, AST%, TOV%, PIE, rankings).
+
         Args:
             team_id: Team ID
             force_refresh: If True, bypass cache
@@ -144,12 +148,94 @@ class DataManager:
         if force_refresh:
             self._cache.invalidate("team_stats", cache_key)
 
-        return await cached(
-            self._cache,
-            "team_stats",
-            cache_key,
-            lambda: self._failover.get_team_stats(team_id),
-        )
+        cached_value = self._cache.get("team_stats", cache_key)
+        if cached_value is not None:
+            return cached_value
+
+        # Fetch ESPN base stats
+        base_stats = await self._failover.get_team_stats(team_id)
+        if not base_stats:
+            return None
+
+        # Overlay NBA.com advanced stats
+        try:
+            all_advanced = await self.get_all_team_advanced_stats()
+            abbr = base_stats.team_abbreviation or ESPN_IDS.get(team_id)
+            if abbr and abbr in all_advanced:
+                self._merge_team_advanced_stats(base_stats, all_advanced[abbr])
+                logger.info(f"Merged NBA.com advanced stats for {abbr}")
+        except Exception as e:
+            logger.warning(f"Failed to merge NBA.com team advanced stats: {e}")
+
+        self._cache.set("team_stats", cache_key, base_stats)
+        return base_stats
+
+    async def get_all_team_advanced_stats(self) -> dict[str, dict[str, float]]:
+        """Get NBA.com advanced stats for all 30 teams.
+
+        Returns:
+            Dictionary keyed by team abbreviation -> {field_name: value}
+        """
+        cache_key = "team_advanced_all"
+        cached_value = self._cache.get("team_stats", cache_key)
+        if cached_value is not None:
+            return cached_value
+
+        raw = await self._nba_client.get_advanced_team_stats()
+        parsed = NBAParser.parse_advanced_team_stats(raw)
+        if parsed:
+            self._cache.set("team_stats", cache_key, parsed)
+            logger.info(f"Cached NBA.com advanced stats for {len(parsed)} teams")
+        return parsed
+
+    @staticmethod
+    def _merge_team_advanced_stats(
+        team_stats: TeamStats, advanced: dict[str, float]
+    ) -> None:
+        """Merge NBA.com advanced stats onto a TeamStats object.
+
+        NBA.com authoritative fields (ORtg, DRtg, pace, net_rating, eFG%, TS%,
+        rankings) overwrite ESPN values. ESPN-only fields (home/away splits,
+        streak, record) are preserved. New fields (AST%, TOV%, PIE, etc.)
+        are always set.
+        """
+        for field_name, value in advanced.items():
+            setattr(team_stats, field_name, value)
+
+    async def get_all_team_stats(self) -> dict[str, TeamStats]:
+        """Get stats for all 30 NBA teams efficiently.
+
+        Fetches NBA.com advanced stats once (1 call), then ESPN base stats
+        for all 30 teams in parallel, merging advanced onto each.
+
+        Returns:
+            Dictionary keyed by team abbreviation -> TeamStats
+        """
+        # 1. Fetch NBA.com advanced stats (single call for all 30 teams)
+        all_advanced = {}
+        try:
+            all_advanced = await self.get_all_team_advanced_stats()
+        except Exception as e:
+            logger.warning(f"Failed to fetch NBA.com advanced stats: {e}")
+
+        # 2. Fetch ESPN base stats for all 30 teams in parallel
+        async def _fetch_one(abbr: str, team_id: str) -> tuple[str, TeamStats | None]:
+            try:
+                base = await self._failover.get_team_stats(team_id)
+                if base and abbr in all_advanced:
+                    self._merge_team_advanced_stats(base, all_advanced[abbr])
+                return abbr, base
+            except Exception as e:
+                logger.warning(f"Failed to fetch stats for {abbr}: {e}")
+                return abbr, None
+
+        tasks = [
+            _fetch_one(abbr, team_id)
+            for abbr, team_id in ESPN_TEAMS.items()
+        ]
+        results = await asyncio.gather(*tasks)
+
+        return {abbr: stats for abbr, stats in results if stats is not None}
 
     async def get_all_injuries(self) -> dict[str, list[PlayerInjury]]:
         """Get injury data for all NBA teams.

@@ -23,6 +23,10 @@ def main():
     parser.add_argument("--date", type=str, default=None, help="Date to scan (YYYYMMDD format, e.g. 20260228). Defaults to today.")
     parser.add_argument("--min-speculate-prob", type=float, default=0.72, help="Minimum model probability to trigger SPECULATE verdict")
     parser.add_argument("--speculate-kelly", type=float, default=0.15, help="Kelly fraction for SPECULATE bets (more conservative)")
+    parser.add_argument("--hold-threshold", type=float, default=0.70, help="Model prob threshold for hold-to-resolution strategy")
+    parser.add_argument("--entry-aggression", type=float, default=0.50, help="Entry price aggression (0=bid, 0.5=mid, 1=ask)")
+    parser.add_argument("--exit-capture", type=float, default=0.80, help="Edge capture fraction for TRADE exits")
+    parser.add_argument("--max-spread", type=float, default=0.08, help="Max bid-ask spread to accept without warning")
     parser.add_argument("--log-level", default="WARNING", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging level")
 
     args = parser.parse_args()
@@ -40,6 +44,10 @@ def main():
         market_weight=1.0 - args.model_weight,
         min_speculate_prob=args.min_speculate_prob,
         speculate_kelly_fraction=args.speculate_kelly,
+        hold_threshold=args.hold_threshold,
+        base_entry_aggression=args.entry_aggression,
+        exit_edge_capture=args.exit_capture,
+        max_spread=args.max_spread,
     )
 
     advisor = PreGameAdvisor(

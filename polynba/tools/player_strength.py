@@ -16,8 +16,15 @@ import logging
 import os
 import sys
 import unicodedata
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+
+_PACIFIC = timezone(timedelta(hours=-8))
+
+
+def _today_pacific() -> date:
+    """Today's date in US Pacific (UTC-8) time."""
+    return datetime.now(_PACIFIC).date()
 
 from polynba.data.espn_teams import ESPN_TEAMS, TEAM_NAMES, lookup_team
 from polynba.data.manager import DataManager
@@ -144,7 +151,7 @@ def print_player_table(players: list[PlayerSeasonStats], title: str) -> None:
 def _default_snapshot_path() -> str:
     """Return default snapshot path: polynba/data/snapshots/players_YYYYMMDD.json"""
     base = Path(__file__).resolve().parent.parent / "data" / "snapshots"
-    return str(base / f"players_{date.today().strftime('%Y%m%d')}.json")
+    return str(base / f"players_{_today_pacific().strftime('%Y%m%d')}.json")
 
 
 def save_snapshot(
@@ -164,7 +171,7 @@ def save_snapshot(
         total_players += len(team_list)
 
     snapshot = {
-        "date": date.today().isoformat(),
+        "date": _today_pacific().isoformat(),
         "player_count": total_players,
         "teams": teams,
     }
@@ -190,6 +197,39 @@ def load_snapshot(path: str) -> dict[str, list[PlayerSeasonStats]]:
         result[team_abbr] = players
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Daily snapshot cache
+# ---------------------------------------------------------------------------
+
+async def _auto_player_index(from_snapshot: str | None = None) -> dict[str, list[PlayerSeasonStats]]:
+    """Load player data from snapshot cache or fetch fresh.
+
+    Resolution order:
+    1. Explicit --from-snapshot path
+    2. Today's snapshot (daily cache, keyed by Pacific date)
+    3. Fresh API fetch -> saved as today's snapshot
+    """
+    if from_snapshot:
+        return load_snapshot(from_snapshot)
+
+    today_path = _default_snapshot_path()
+    if os.path.exists(today_path):
+        print(f"  (using cached snapshot: {os.path.basename(today_path)})")
+        return load_snapshot(today_path)
+
+    # No cache — fetch and save
+    dm = DataManager()
+    try:
+        print("Fetching all players (3 NBA.com calls)...")
+        player_index = await dm.get_all_players_full()
+        if player_index:
+            abs_path = save_snapshot(player_index, today_path)
+            print(f"  Snapshot cached: {abs_path}")
+        return player_index
+    finally:
+        await dm.close()
 
 
 # ---------------------------------------------------------------------------
@@ -242,91 +282,34 @@ async def run_team(abbr: str, top_n: int, from_snapshot: str | None = None) -> N
     team_abbr, team_id = result
     full_name = TEAM_NAMES.get(team_abbr, team_abbr)
 
-    if from_snapshot:
-        player_index = load_snapshot(from_snapshot)
-        team_players = player_index.get(team_abbr, [])
-        if not team_players:
-            print(f"No player data found for {team_abbr} in snapshot")
-            return
-        players = sorted(team_players, key=lambda p: p.points_per_game, reverse=True)[:top_n]
-        print_player_table(players, f"Player Strength: {full_name} ({team_abbr})")
+    player_index = await _auto_player_index(from_snapshot)
+    team_players = player_index.get(team_abbr, [])
+    if not team_players:
+        print(f"No player data found for {team_abbr}")
         return
-
-    dm = DataManager()
-    try:
-        player_index = await dm.get_player_index()
-        enriched = await dm._enrich_rotation_with_stats(team_id, team_abbr, player_index)
-
-        if not enriched:
-            # Fall back to baseline stats without enrichment
-            team_players = player_index.get(team_abbr, [])
-            if not team_players:
-                print(f"No player data found for {team_abbr}")
-                return
-            players = sorted(team_players, key=lambda p: p.points_per_game, reverse=True)[:top_n]
-        else:
-            players = sorted(enriched.values(), key=lambda p: p.points_per_game, reverse=True)[:top_n]
-
-        print_player_table(players, f"Player Strength: {full_name} ({team_abbr})")
-    finally:
-        await dm.close()
+    players = sorted(team_players, key=lambda p: p.points_per_game, reverse=True)[:top_n]
+    print_player_table(players, f"Player Strength: {full_name} ({team_abbr})")
 
 
 async def run_player(name_query: str, top_n: int, from_snapshot: str | None = None) -> None:
-    if from_snapshot:
-        player_index = load_snapshot(from_snapshot)
-    else:
-        player_index = None
+    player_index = await _auto_player_index(from_snapshot)
 
-    dm = DataManager() if not from_snapshot else None
-    try:
-        if player_index is None:
-            assert dm is not None
-            player_index = await dm.get_player_index()
+    q = _normalize(name_query)
 
-        q = _normalize(name_query)
+    # Search across all teams (normalize to handle diacritics)
+    matches: list[PlayerSeasonStats] = []
+    for team_abbr, players in player_index.items():
+        for ps in players:
+            if q in _normalize(ps.player_name):
+                matches.append(ps)
 
-        # Search across all teams (normalize to handle diacritics)
-        matches: list[tuple[str, PlayerSeasonStats]] = []
-        for team_abbr, players in player_index.items():
-            for ps in players:
-                if q in _normalize(ps.player_name):
-                    matches.append((team_abbr, ps))
+    if not matches:
+        print(f"No players found matching '{name_query}'")
+        return
 
-        if not matches:
-            print(f"No players found matching '{name_query}'")
-            return
-
-        if from_snapshot:
-            # Snapshot already has full stats — no enrichment needed
-            enriched_players = [ps for _, ps in matches]
-        else:
-            # Group by team for enrichment
-            assert dm is not None
-            teams_to_enrich: dict[str, list[PlayerSeasonStats]] = {}
-            for team_abbr, ps in matches:
-                teams_to_enrich.setdefault(team_abbr, []).append(ps)
-
-            enriched_players = []
-            for team_abbr, team_matches in teams_to_enrich.items():
-                team_id = ESPN_TEAMS.get(team_abbr)
-                if team_id:
-                    enriched = await dm._enrich_rotation_with_stats(team_id, team_abbr, player_index)
-                    for ps in team_matches:
-                        if ps.player_name in enriched:
-                            enriched_players.append(enriched[ps.player_name])
-                        else:
-                            enriched_players.append(ps)
-                else:
-                    enriched_players.extend(team_matches)
-
-        enriched_players.sort(key=lambda p: p.points_per_game, reverse=True)
-        enriched_players = enriched_players[:top_n]
-
-        print_player_table(enriched_players, f"Player Strength: '{name_query}' search")
-    finally:
-        if dm:
-            await dm.close()
+    matches.sort(key=lambda p: p.points_per_game, reverse=True)
+    matches = matches[:top_n]
+    print_player_table(matches, f"Player Strength: '{name_query}' search")
 
 
 async def main() -> None:

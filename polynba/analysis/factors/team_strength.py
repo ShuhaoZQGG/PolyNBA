@@ -48,6 +48,43 @@ class StrengthTierComparison:
 
 
 @dataclass
+class AdvancedStatsComparison:
+    """Four Factors + advanced stat diffs between home and away teams.
+
+    All diffs are home - away; positive = home advantage.
+    """
+
+    efg_diff: float           # eFG% diff (percentage points, e.g. 2.1)
+    tov_diff: float           # TOV% diff (negative = home turns over less = good)
+    oreb_diff: float          # OREB% diff
+    ft_rate_diff: float       # FT rate proxy diff (FT% * FTA-ratio estimate)
+    pie_diff: float           # PIE diff
+    ast_to_diff: float        # AST/TO ratio diff
+    four_factors_score: float # Composite Dean Oliver score (-15 to +15)
+
+    @property
+    def has_data(self) -> bool:
+        return self.four_factors_score != 0.0
+
+
+@dataclass
+class RotationComparison:
+    """Rotation EIR comparison between home and away teams."""
+
+    home_starter_avg_eir: float
+    away_starter_avg_eir: float
+    home_top8_avg_eir: float
+    away_top8_avg_eir: float
+    home_bench_avg_eir: float
+    away_bench_avg_eir: float
+    rotation_score: float  # Composite score (-10 to +10)
+
+    @property
+    def has_data(self) -> bool:
+        return self.home_top8_avg_eir > 0 or self.away_top8_avg_eir > 0
+
+
+@dataclass
 class TeamStrengthOutput:
     """Output from team strength factor."""
 
@@ -58,6 +95,8 @@ class TeamStrengthOutput:
     away_advantages: list[str]
     injury_impact: int  # -50 to +50
     reasoning: str
+    advanced_stats: Optional[AdvancedStatsComparison] = None
+    rotation: Optional[RotationComparison] = None
 
 
 class TeamStrengthFactor:
@@ -140,14 +179,38 @@ class TeamStrengthFactor:
                 f"Using records as primary quality signal."
             )
 
-        # Combine with weights (adjusted when net_rating data is unavailable)
+        # Score new factors (guarded: return 0 when data missing)
+        four_factors_score, advanced_stats = self._score_four_factors(home, away)
+        rotation_score, rotation_comp = self._score_rotation_strength(
+            input_data.home_context, input_data.away_context
+        )
+
+        has_advanced = advanced_stats is not None and advanced_stats.has_data
+        has_rotation = rotation_comp is not None and rotation_comp.has_data
+
+        # Combine with weights — scale existing down when advanced data available
         nr_w, rec_w, ha_w, str_w = self._get_effective_weights(home, away)
+
+        if has_advanced or has_rotation:
+            # Scale existing weights by 0.85 to make room for new factors
+            scale = 0.85
+            nr_w *= scale
+            rec_w *= scale
+            ha_w *= scale
+            str_w *= scale
+
         raw_score = (
             net_rating_score * nr_w
             + record_score * rec_w
             + home_away_score * ha_w
             + streak_score * str_w
         )
+
+        # Add Four Factors (10% weight) and Rotation (5% weight)
+        if has_advanced:
+            raw_score += four_factors_score * 0.10
+        if has_rotation:
+            raw_score += rotation_score * 0.05
 
         # Analyze injury impact if context available
         injury_impact = 0
@@ -157,11 +220,26 @@ class TeamStrengthFactor:
             )
             raw_score += injury_impact * 0.5
 
+        # Bonus advantages from advanced data
+        if advanced_stats and advanced_stats.has_data:
+            if advanced_stats.efg_diff > 2.0:
+                raw_score += 2.0
+            elif advanced_stats.efg_diff < -2.0:
+                raw_score -= 2.0
+            if advanced_stats.tov_diff < -1.5:
+                raw_score += 1.5  # Home turns over less
+            elif advanced_stats.tov_diff > 1.5:
+                raw_score -= 1.5
+        if rotation_comp and rotation_comp.has_data and abs(rotation_comp.rotation_score) > 3:
+            raw_score += rotation_comp.rotation_score * 0.3
+
         score = int(max(-100, min(100, raw_score)))
 
         # Identify advantages
         home_advantages, away_advantages = self._identify_advantages(
-            home, away, efficiency, tiers
+            home, away, efficiency, tiers,
+            advanced_stats=advanced_stats,
+            rotation=rotation_comp,
         )
 
         reasoning = self._generate_reasoning(
@@ -176,6 +254,8 @@ class TeamStrengthFactor:
             away_advantages=away_advantages,
             injury_impact=injury_impact,
             reasoning=reasoning,
+            advanced_stats=advanced_stats,
+            rotation=rotation_comp,
         )
 
     def _get_effective_weights(self, home: TeamStats, away: TeamStats) -> tuple[float, float, float, float]:
@@ -272,6 +352,154 @@ class TeamStrengthFactor:
 
         diff = home_streak - away_streak
         return diff * 5
+
+    def _score_four_factors(
+        self, home: TeamStats, away: TeamStats
+    ) -> tuple[float, Optional[AdvancedStatsComparison]]:
+        """Score based on Dean Oliver's Four Factors.
+
+        Weights: eFG% (40%), TOV% (25%), OREB% (20%), FT rate (15%).
+        Returns score in [-15, +15] range and the comparison data.
+        Returns (0.0, None) when eFG% data is missing.
+        """
+        # Guard: need eFG% for both teams
+        if home.effective_field_goal_percentage == 0.0 or away.effective_field_goal_percentage == 0.0:
+            return 0.0, None
+
+        # eFG% diff (percentage points, e.g. home 52% - away 50% = +2.0)
+        efg_diff = (home.effective_field_goal_percentage - away.effective_field_goal_percentage) * 100
+
+        # TOV% diff (lower is better, so negate: home 12% - away 14% = -2, good for home)
+        # turnover_pct is a fraction (0.125 = 12.5%)
+        tov_diff = (home.turnover_pct - away.turnover_pct) * 100
+
+        # OREB% diff (higher is better)
+        oreb_diff = (home.offensive_rebound_pct - away.offensive_rebound_pct) * 100
+
+        # FT rate proxy: FT% is available; approximate FT rate with FT%
+        # (not ideal but best available without FTA/FGA ratio)
+        ft_home = home.free_throw_percentage if home.free_throw_percentage > 0 else 75.0
+        ft_away = away.free_throw_percentage if away.free_throw_percentage > 0 else 75.0
+        ft_rate_diff = ft_home - ft_away
+
+        # Composite: Dean Oliver weights, scale each factor to contribute proportionally
+        # eFG diff of 3 pct points is huge → scale so 3 → ~4.5 contribution (40% weight)
+        # TOV diff of 2 pct points → scale so 2 → ~2.5 contribution (25% weight, inverted)
+        # OREB diff of 2 pct points → scale so 2 → ~2.0 contribution (20% weight)
+        # FT rate diff of 5 pct points → scale so 5 → ~1.5 contribution (15% weight)
+        composite = (
+            efg_diff * 1.5 * 0.40          # eFG: 40% weight
+            + (-tov_diff) * 1.25 * 0.25    # TOV: 25% weight (inverted: less is better)
+            + oreb_diff * 1.0 * 0.20       # OREB: 20% weight
+            + ft_rate_diff * 0.06 * 0.15   # FT: 15% weight (smaller scale)
+        )
+
+        # Clamp to [-15, +15]
+        composite = max(-15.0, min(15.0, composite))
+
+        # PIE and AST/TO diffs (informational, not in composite)
+        pie_diff = (home.team_pie - away.team_pie) * 100
+        ast_to_diff = home.assist_to_turnover - away.assist_to_turnover
+
+        comparison = AdvancedStatsComparison(
+            efg_diff=efg_diff,
+            tov_diff=tov_diff,
+            oreb_diff=oreb_diff,
+            ft_rate_diff=ft_rate_diff,
+            pie_diff=pie_diff,
+            ast_to_diff=ast_to_diff,
+            four_factors_score=composite,
+        )
+
+        logger.info(
+            f"  Four Factors: eFG% diff={efg_diff:+.1f}, TOV% diff={tov_diff:+.1f}, "
+            f"OREB% diff={oreb_diff:+.1f} → composite={composite:+.1f}"
+        )
+
+        # Scale composite to the raw_score space (Four Factors weight applied in calculate())
+        # composite is [-15, +15]; scale to [-100, +100] for consistent weighting
+        return composite * (100 / 15), comparison
+
+    def _score_rotation_strength(
+        self,
+        home_ctx: Optional[TeamContext],
+        away_ctx: Optional[TeamContext],
+    ) -> tuple[float, Optional[RotationComparison]]:
+        """Score based on rotation EIR comparison.
+
+        Weights: top-8 avg EIR (50%), starter avg EIR (30%), bench avg EIR (20%).
+        Returns score in [-10, +10] range and the comparison data.
+        Returns (0.0, None) when context or player data is unavailable.
+        """
+        if not home_ctx or not away_ctx:
+            return 0.0, None
+
+        home_players = list(home_ctx.player_stats_map.values())
+        away_players = list(away_ctx.player_stats_map.values())
+
+        if not home_players or not away_players:
+            return 0.0, None
+
+        def _rotation_eirs(players: list[PlayerSeasonStats]) -> tuple[float, float, float]:
+            """Return (starter_avg, top8_avg, bench_avg) EIR."""
+            # Sort by minutes descending to identify starters vs bench
+            by_mins = sorted(players, key=lambda p: p.minutes_per_game, reverse=True)
+            starters = [p for p in by_mins if p.minutes_per_game >= 24][:5]
+            top8 = by_mins[:8]
+            bench = [p for p in by_mins if p.is_bench and p.estimated_impact_rating > 0]
+
+            starter_avg = (
+                sum(p.estimated_impact_rating for p in starters) / len(starters)
+                if starters else 0.0
+            )
+            top8_avg = (
+                sum(p.estimated_impact_rating for p in top8) / len(top8)
+                if top8 else 0.0
+            )
+            bench_avg = (
+                sum(p.estimated_impact_rating for p in bench) / len(bench)
+                if bench else 0.0
+            )
+            return starter_avg, top8_avg, bench_avg
+
+        h_starter, h_top8, h_bench = _rotation_eirs(home_players)
+        a_starter, a_top8, a_bench = _rotation_eirs(away_players)
+
+        if h_top8 == 0.0 and a_top8 == 0.0:
+            return 0.0, None
+
+        # Composite: top-8 (50%), starters (30%), bench (20%)
+        top8_diff = h_top8 - a_top8
+        starter_diff = h_starter - a_starter
+        bench_diff = h_bench - a_bench
+
+        composite = (
+            top8_diff * 0.50
+            + starter_diff * 0.30
+            + bench_diff * 0.20
+        )
+
+        # Clamp to [-10, +10]
+        composite = max(-10.0, min(10.0, composite))
+
+        comparison = RotationComparison(
+            home_starter_avg_eir=h_starter,
+            away_starter_avg_eir=a_starter,
+            home_top8_avg_eir=h_top8,
+            away_top8_avg_eir=a_top8,
+            home_bench_avg_eir=h_bench,
+            away_bench_avg_eir=a_bench,
+            rotation_score=composite,
+        )
+
+        logger.info(
+            f"  Rotation: top-8 EIR {h_top8:.1f} vs {a_top8:.1f}, "
+            f"starters {h_starter:.1f} vs {a_starter:.1f} → score={composite:+.1f}"
+        )
+
+        # Scale composite to raw_score space (Rotation weight applied in calculate())
+        # composite is [-10, +10]; scale to [-100, +100]
+        return composite * (100 / 10), comparison
 
     def _player_injury_impact(self, injury: PlayerInjury) -> float:
         """Estimate net rating impact of losing one player using EIR + NET_RATING.
@@ -433,6 +661,8 @@ class TeamStrengthFactor:
         away: TeamStats,
         efficiency: EfficiencyComparison,
         tiers: StrengthTierComparison,
+        advanced_stats: Optional[AdvancedStatsComparison] = None,
+        rotation: Optional[RotationComparison] = None,
     ) -> tuple[list[str], list[str]]:
         """Identify specific advantages for each team."""
         home_adv = []
@@ -465,6 +695,25 @@ class TeamStrengthFactor:
             away_adv.append(f"{away.current_streak} game win streak")
         elif away.current_streak <= -3:
             home_adv.append(f"Opponent on {-away.current_streak} game losing streak")
+
+        # Shooting efficiency (Four Factors)
+        if advanced_stats and advanced_stats.has_data:
+            if advanced_stats.efg_diff > 2.0:
+                home_adv.append(f"Better shooting efficiency (eFG% +{advanced_stats.efg_diff:.1f})")
+            elif advanced_stats.efg_diff < -2.0:
+                away_adv.append(f"Better shooting efficiency (eFG% +{-advanced_stats.efg_diff:.1f})")
+
+            if advanced_stats.tov_diff < -1.5:
+                home_adv.append("Better ball security")
+            elif advanced_stats.tov_diff > 1.5:
+                away_adv.append("Better ball security")
+
+        # Rotation depth
+        if rotation and rotation.has_data:
+            if rotation.rotation_score > 3:
+                home_adv.append(f"Deeper rotation (top-8 EIR {rotation.home_top8_avg_eir:.1f} vs {rotation.away_top8_avg_eir:.1f})")
+            elif rotation.rotation_score < -3:
+                away_adv.append(f"Deeper rotation (top-8 EIR {rotation.away_top8_avg_eir:.1f} vs {rotation.home_top8_avg_eir:.1f})")
 
         return home_adv, away_adv
 

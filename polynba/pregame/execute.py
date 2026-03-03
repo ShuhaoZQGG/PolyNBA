@@ -14,6 +14,7 @@ environment variables (same as the trading bot).
 
 import argparse
 import asyncio
+import math
 import os
 import sys
 from decimal import Decimal
@@ -66,13 +67,20 @@ async def _execute(args: argparse.Namespace) -> None:
     side = TradeSide.BUY if args.side == "buy" else TradeSide.SELL
     price = Decimal(str(args.price))
     usdc_size = Decimal(str(args.size))
-    size_shares = usdc_size / price
+    # Polymarket requires integer share sizes — floor to avoid cancellation
+    size_shares = Decimal(math.floor(float(usdc_size / price)))
+
+    if size_shares <= 0:
+        print("ERROR: size too small — results in 0 shares at this price.", file=sys.stderr)
+        sys.exit(1)
+
+    actual_usdc = size_shares * price
 
     print(f"Placing {args.side.upper()} order:")
     print(f"  Token ID:  {args.token_id}")
     print(f"  Market ID: {args.market_id}")
     print(f"  Price:     {price}")
-    print(f"  Size:      {size_shares:.2f} shares (${usdc_size} USDC)")
+    print(f"  Size:      {size_shares} shares (${actual_usdc:.2f} USDC)")
     print()
 
     result = await executor.place_order(

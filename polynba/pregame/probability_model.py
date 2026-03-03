@@ -49,6 +49,12 @@ class PreGameModelConfig:
     # More conservative Kelly fraction for speculate bets.
     speculate_kelly_fraction: float = 0.15
 
+    # Trading plan parameters
+    hold_threshold: float = 0.70          # Model prob for RESOLUTION strategy
+    base_entry_aggression: float = 0.50   # 0=bid, 0.5=mid, 1=ask
+    exit_edge_capture: float = 0.80       # Fraction of edge for TRADE exit
+    max_spread: float = 0.08             # Max acceptable spread
+
 
 @dataclass
 class PreGameEstimate:
@@ -81,6 +87,21 @@ class PreGameEstimate:
     strength_output: Optional[TeamStrengthOutput] = None
     head_to_head: Optional[HeadToHead] = None
     factors_summary: list[str] = field(default_factory=list)
+
+
+@dataclass
+class TradingPlan:
+    """Smart entry/exit pricing plan for a bet recommendation."""
+
+    strategy: str                     # "TRADE" or "RESOLUTION"
+    entry_price: float                # Limit buy price (tick-rounded)
+    exit_price: Optional[float]       # Limit sell target (TRADE only)
+    expected_roi: float               # Expected return on investment
+    bet_side_prob: float              # Model prob for the bet side
+    spread: Optional[float]           # Bid-ask spread
+    spread_pct: Optional[float]       # Spread as % of mid
+    depth_available: float            # Ask-side depth in USDC
+    liquidity_warning: bool = False   # Spread too wide or depth too low
 
 
 class PreGameProbabilityModel:
@@ -421,6 +442,35 @@ class PreGameProbabilityModel:
             summary.append(
                 f"H2H: {head_to_head.team1_wins}-{head_to_head.team2_wins} "
                 f"this season (adj {adj:+.1%})"
+            )
+
+        # ---- Four Factors line ----
+        so = strength_output
+        if so.advanced_stats and so.advanced_stats.has_data and abs(so.advanced_stats.four_factors_score) > 3:
+            adv = so.advanced_stats
+            better = home_abbr if adv.four_factors_score > 0 else away_abbr
+            summary.append(
+                f"Four Factors: {better} edge "
+                f"(eFG% {adv.efg_diff:+.1f}, TOV% {adv.tov_diff:+.1f}, "
+                f"OREB% {adv.oreb_diff:+.1f}) → score {adv.four_factors_score:+.1f}"
+            )
+
+        # ---- Rotation line ----
+        if so.rotation and so.rotation.has_data and abs(so.rotation.rotation_score) > 2:
+            rot = so.rotation
+            better = home_abbr if rot.rotation_score > 0 else away_abbr
+            summary.append(
+                f"Rotation: {better} deeper "
+                f"(top-8 EIR {rot.home_top8_avg_eir:.1f} vs {rot.away_top8_avg_eir:.1f})"
+            )
+
+        # ---- Clutch line ----
+        clutch_nr_diff = home_stats.clutch_net_rating - away_stats.clutch_net_rating
+        if abs(clutch_nr_diff) > 5:
+            better = home_abbr if clutch_nr_diff > 0 else away_abbr
+            summary.append(
+                f"Clutch: {better} edge "
+                f"(NRtg {home_stats.clutch_net_rating:+.1f} vs {away_stats.clutch_net_rating:+.1f})"
             )
 
         # ---- Home/away splits line ----

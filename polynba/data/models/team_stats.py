@@ -43,6 +43,29 @@ class TeamStats:
     true_shooting_percentage: float = 0.0
     rebound_percentage: float = 0.0
 
+    # Team advanced stats (from NBA.com leaguedashteamstats)
+    assist_pct: float = 0.0               # AST_PCT (fraction, 0.62 = 62%)
+    assist_to_turnover: float = 0.0       # AST_TO (ratio, e.g. 1.85)
+    assist_ratio: float = 0.0             # AST_RATIO (per 100 poss)
+    offensive_rebound_pct: float = 0.0    # OREB_PCT (fraction)
+    defensive_rebound_pct: float = 0.0    # DREB_PCT (fraction)
+    turnover_pct: float = 0.0             # TM_TOV_PCT (fraction, 0.125 = 12.5%)
+    team_pie: float = 0.0                 # PIE (fraction)
+    estimated_offensive_rating: float = 0.0
+    estimated_defensive_rating: float = 0.0
+    estimated_net_rating: float = 0.0
+    possessions: float = 0.0              # POSS per game
+    minutes: float = 0.0                  # MIN per game
+
+    # Additional rankings (from NBA.com)
+    effective_fg_pct_rank: int = 0
+    true_shooting_pct_rank: int = 0
+    assist_pct_rank: int = 0
+    assist_to_turnover_rank: int = 0
+    rebound_pct_rank: int = 0
+    turnover_pct_rank: int = 0
+    pie_rank: int = 0
+
     # Clutch stats (last 5 minutes, within 5 points)
     clutch_net_rating: float = 0.0
     clutch_wins: int = 0

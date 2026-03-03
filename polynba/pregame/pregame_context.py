@@ -152,13 +152,13 @@ def _build_game_context(
             stat_note = ""
             if inj.player_stats:
                 s = inj.player_stats
-                stat_note = f" ({s.points_per_game:.1f}/{s.rebounds_per_game:.1f}/{s.assists_per_game:.1f})"
+                stat_note = f" ({s.points_per_game:.1f}/{s.rebounds_per_game:.1f}/{s.assists_per_game:.1f}, EIR {s.estimated_impact_rating:.1f})"
             lines.append(f"  {home.team_abbreviation}: {inj.player_name}{stat_note} — {inj.injury_description}")
         for inj in away_out:
             stat_note = ""
             if inj.player_stats:
                 s = inj.player_stats
-                stat_note = f" ({s.points_per_game:.1f}/{s.rebounds_per_game:.1f}/{s.assists_per_game:.1f})"
+                stat_note = f" ({s.points_per_game:.1f}/{s.rebounds_per_game:.1f}/{s.assists_per_game:.1f}, EIR {s.estimated_impact_rating:.1f})"
             lines.append(f"  {away.team_abbreviation}: {inj.player_name}{stat_note} — {inj.injury_description}")
 
     # Active Depth (bench stepping up when starters are injured)
@@ -183,6 +183,96 @@ def _build_game_context(
             lines.append("")
             lines.append("Active Depth (bench stepping up):")
             lines.extend(depth_lines)
+
+    # Advanced Stats Matchup (when eFG% data available)
+    if home.effective_field_goal_percentage > 0 and away.effective_field_goal_percentage > 0:
+        lines.append("")
+        lines.append("Advanced Stats Matchup:")
+
+        def _edge(val: float) -> str:
+            if val > 1.0:
+                return " ◀"
+            elif val < -1.0:
+                return " ▶"
+            return ""
+
+        efg_diff = (home.effective_field_goal_percentage - away.effective_field_goal_percentage) * 100
+        lines.append(
+            f"  eFG%:   {home.team_abbreviation} {home.effective_field_goal_percentage*100:.1f}%  vs  "
+            f"{away.team_abbreviation} {away.effective_field_goal_percentage*100:.1f}%{_edge(efg_diff)}"
+        )
+
+        if home.true_shooting_percentage > 0 and away.true_shooting_percentage > 0:
+            ts_diff = (home.true_shooting_percentage - away.true_shooting_percentage) * 100
+            lines.append(
+                f"  TS%:    {home.team_abbreviation} {home.true_shooting_percentage*100:.1f}%  vs  "
+                f"{away.team_abbreviation} {away.true_shooting_percentage*100:.1f}%{_edge(ts_diff)}"
+            )
+
+        if home.turnover_pct > 0 and away.turnover_pct > 0:
+            # Lower TOV% is better, so negate for edge indicator
+            tov_diff = -(home.turnover_pct - away.turnover_pct) * 100
+            lines.append(
+                f"  TOV%:   {home.team_abbreviation} {home.turnover_pct*100:.1f}%  vs  "
+                f"{away.team_abbreviation} {away.turnover_pct*100:.1f}%{_edge(tov_diff)}"
+            )
+
+        if home.assist_to_turnover > 0 and away.assist_to_turnover > 0:
+            ast_diff = home.assist_to_turnover - away.assist_to_turnover
+            lines.append(
+                f"  AST/TO: {home.team_abbreviation} {home.assist_to_turnover:.2f}  vs  "
+                f"{away.team_abbreviation} {away.assist_to_turnover:.2f}{_edge(ast_diff * 3)}"
+            )
+
+        if home.offensive_rebound_pct > 0 and away.offensive_rebound_pct > 0:
+            oreb_diff = (home.offensive_rebound_pct - away.offensive_rebound_pct) * 100
+            lines.append(
+                f"  OREB%:  {home.team_abbreviation} {home.offensive_rebound_pct*100:.1f}%  vs  "
+                f"{away.team_abbreviation} {away.offensive_rebound_pct*100:.1f}%{_edge(oreb_diff)}"
+            )
+
+        lines.append(
+            f"  Pace:   {home.team_abbreviation} {home.pace:.1f}  vs  "
+            f"{away.team_abbreviation} {away.pace:.1f}"
+        )
+
+    # Rotation Strength (when player data available)
+    home_players = list(home_ctx.player_stats_map.values())
+    away_players = list(away_ctx.player_stats_map.values())
+    if home_players and away_players:
+        def _avg_eir(players: list[PlayerSeasonStats], min_mpg: float, max_count: int) -> float:
+            eligible = sorted(
+                [p for p in players if p.minutes_per_game >= min_mpg],
+                key=lambda p: p.minutes_per_game, reverse=True,
+            )[:max_count]
+            return sum(p.estimated_impact_rating for p in eligible) / len(eligible) if eligible else 0.0
+
+        def _bench_avg_eir(players: list[PlayerSeasonStats]) -> float:
+            bench = [p for p in players if p.is_bench and p.estimated_impact_rating > 0]
+            return sum(p.estimated_impact_rating for p in bench) / len(bench) if bench else 0.0
+
+        h_starter = _avg_eir(home_players, 24, 5)
+        a_starter = _avg_eir(away_players, 24, 5)
+        h_top8 = _avg_eir(home_players, 0, 8)
+        a_top8 = _avg_eir(away_players, 0, 8)
+        h_bench = _bench_avg_eir(home_players)
+        a_bench = _bench_avg_eir(away_players)
+
+        if h_top8 > 0 or a_top8 > 0:
+            lines.append("")
+            lines.append("Rotation Strength (avg EIR):")
+            lines.append(
+                f"  Starters: {home.team_abbreviation} {h_starter:.1f}  vs  "
+                f"{away.team_abbreviation} {a_starter:.1f}"
+            )
+            lines.append(
+                f"  Top-8:    {home.team_abbreviation} {h_top8:.1f}  vs  "
+                f"{away.team_abbreviation} {a_top8:.1f}"
+            )
+            lines.append(
+                f"  Bench:    {home.team_abbreviation} {h_bench:.1f}  vs  "
+                f"{away.team_abbreviation} {a_bench:.1f}"
+            )
 
     # H2H
     if h2h is not None and h2h.games_played > 0:
@@ -227,6 +317,20 @@ def _build_quant_analysis(
         so = estimate.strength_output
         lines.append(f"Strength score: {so.score:+d}")
         lines.append(f"Tiers: {so.tiers.home_tier} vs {so.tiers.away_tier} (mismatch: {so.tiers.mismatch_level})")
+
+        if so.advanced_stats and so.advanced_stats.has_data:
+            adv = so.advanced_stats
+            lines.append(
+                f"Four Factors score: {adv.four_factors_score:+.1f} "
+                f"(eFG% {adv.efg_diff:+.1f}, TOV% {adv.tov_diff:+.1f}, OREB% {adv.oreb_diff:+.1f})"
+            )
+
+        if so.rotation and so.rotation.has_data:
+            rot = so.rotation
+            lines.append(
+                f"Rotation score: {rot.rotation_score:+.1f} "
+                f"(top-8 EIR: {rot.home_top8_avg_eir:.1f} vs {rot.away_top8_avg_eir:.1f})"
+            )
 
     # Bench depth EIR averages (when injuries exist)
     if home_ctx and away_ctx:

@@ -257,6 +257,38 @@ class NBAClient:
         )
         return await self._request_stats(url)
 
+    async def get_advanced_team_stats(self, season: str = "2025-26") -> dict[str, Any]:
+        """Get advanced team stats from stats.nba.com for all 30 teams.
+
+        Args:
+            season: NBA season string (e.g. "2025-26")
+
+        Returns:
+            Advanced team stats JSON data (resultSets format)
+        """
+        url = (
+            f"{self.STATS_URL}/leaguedashteamstats"
+            f"?Conference=&DateFrom=&DateTo=&Division="
+            f"&GameScope=&GameSegment=&Height="
+            f"&ISTRound=&LastNGames=0&LeagueID=00&Location="
+            f"&MeasureType=Advanced&Month=0&OpponentTeamID=0&Outcome="
+            f"&PORound=0&PaceAdjust=N&PerMode=PerGame&Period=0"
+            f"&PlayerExperience=&PlayerPosition=&PlusMinus=N&Rank=N"
+            f"&Season={season}&SeasonSegment=&SeasonType=Regular%20Season"
+            f"&ShotClockRange=&StarterBench=&TeamID=0&VsConference="
+            f"&VsDivision="
+        )
+        logger.debug(f"Fetching NBA.com advanced team stats for {season}")
+
+        if HAS_CURL_CFFI:
+            return await self._request_stats_impersonated(url)
+
+        logger.warning(
+            "curl_cffi not installed — falling back to aiohttp for stats.nba.com "
+            "(likely to be blocked by TLS fingerprinting)"
+        )
+        return await self._request_stats(url)
+
     @retry(
         retry=retry_if_exception_type(aiohttp.ClientError),
         stop=stop_after_attempt(3),
