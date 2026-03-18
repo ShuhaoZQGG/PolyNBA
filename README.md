@@ -9,6 +9,8 @@ NBA live in-game trading bot for Polymarket. It ingests live game data, estimate
 - Paper trading executor with position, order, and risk management.
 - Optional Claude analysis with caching and budget controls.
 - Performance tracking and summary reporting.
+- **Pre-game advisor** with AI-powered analysis (`--ai-analysis`, `--ai-model`).
+- **Web dashboard** — React frontend + FastAPI backend for visual game browsing, analysis, and trading.
 
 ## Project layout
 - `polynba/bot/`: CLI entrypoint and trading loop orchestration.
@@ -17,15 +19,23 @@ NBA live in-game trading bot for Polymarket. It ingests live game data, estimate
 - `polynba/strategy/`: strategy loader and rule engine.
 - `polynba/trading/`: executors, order/position/risk management.
 - `polynba/config/`: default config and risk limits.
+- `polynba/pregame/`: pre-game betting advisor with AI analysis.
+- `web/backend/`: FastAPI backend — markets, games, analysis, portfolio, trading APIs.
+- `web/frontend/`: React + TypeScript SPA — dashboard, game detail, activity pages.
 
 ## Requirements
 - Python 3.11+
 - Dependencies from `pyproject.toml` or `requirements.txt`
 - Optional: `ANTHROPIC_API_KEY` for Claude analysis
+- Optional: Node.js 18+ for the web frontend
 
 ## Install
 ```bash
 pip install -r requirements.txt
+
+# For the web dashboard (backend + frontend):
+pip install -e ".[web]"
+cd web/frontend && npm install
 ```
 
 ## Quick start (paper trading)
@@ -114,6 +124,22 @@ python -m polynba --analyze
 
 ## Live trading note
 The current trading loop instantiates `PaperTradingExecutor` by default. Live trading requires wiring a `LiveTradingExecutor` with a private key and Polymarket CLOB access in your own integration.
+
+## Web dashboard
+
+The web dashboard provides a visual interface for browsing today's games, viewing probability analysis, and placing trades.
+
+```bash
+# Start the FastAPI backend (port 8000)
+uvicorn web.backend.app:app --reload --port 8000
+
+# In another terminal, start the React dev server (port 5173)
+cd web/frontend && npm run dev
+```
+
+Open http://localhost:5173 to use the dashboard. API docs at http://localhost:8000/docs.
+
+See [web/backend/README.md](web/backend/README.md) and [web/frontend/README.md](web/frontend/README.md) for details.
 
 ## Tests
 ```bash
