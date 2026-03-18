@@ -218,26 +218,27 @@ class MarketDiscovery:
     ) -> list[PolymarketNBAMarket]:
         """Process NBA events and extract moneyline markets.
 
+        Uses asyncio.gather with bounded concurrency for parallel fetching.
+
         Args:
             events: List of events from series data
 
         Returns:
             List of PolymarketNBAMarket objects
         """
-        nba_markets = []
+        import asyncio
+
         today = datetime.now().date()
         cutoff = today + timedelta(days=3)  # Look 3 days ahead
 
+        # Filter eligible events first (no HTTP needed)
+        eligible_event_ids: list[str] = []
         for event in events:
-            # Skip closed events
             if event.get("closed", True):
                 continue
-
-            # Check event date
             end_date_str = event.get("endDate", "")
             if not end_date_str:
                 continue
-
             try:
                 game_date = datetime.fromisoformat(
                     end_date_str.replace("Z", "+00:00")
@@ -246,17 +247,29 @@ class MarketDiscovery:
                     continue
             except (ValueError, TypeError):
                 continue
-
-            # Fetch full event details to get markets
             event_id = event.get("id")
-            if not event_id:
-                continue
+            if event_id:
+                eligible_event_ids.append(str(event_id))
 
-            full_event = await self._fetch_event_details(str(event_id))
+        if not eligible_event_ids:
+            return []
+
+        # Fetch all event details concurrently with bounded concurrency
+        semaphore = asyncio.Semaphore(5)
+
+        async def _fetch_with_limit(event_id: str) -> Optional[dict]:
+            async with semaphore:
+                return await self._fetch_event_details(event_id)
+
+        full_events = await asyncio.gather(
+            *[_fetch_with_limit(eid) for eid in eligible_event_ids]
+        )
+
+        # Extract moneyline markets from fetched events
+        nba_markets = []
+        for full_event in full_events:
             if not full_event:
                 continue
-
-            # Find the moneyline market
             market = self._find_moneyline_market(full_event)
             if market:
                 nba_markets.append(market)

@@ -350,7 +350,9 @@ class PriceFetcher:
         self,
         markets: list[PolymarketNBAMarket],
     ) -> dict[str, MarketPrices]:
-        """Fetch prices for multiple markets.
+        """Fetch prices for multiple markets concurrently.
+
+        Uses asyncio.gather with bounded concurrency for parallel fetching.
 
         Args:
             markets: List of markets to fetch prices for
@@ -358,14 +360,20 @@ class PriceFetcher:
         Returns:
             Dict mapping condition_id to MarketPrices
         """
-        results = {}
+        import asyncio
 
-        for market in markets:
-            prices = await self.get_market_prices(market)
-            if prices:
-                results[market.condition_id] = prices
+        semaphore = asyncio.Semaphore(5)
 
-        return results
+        async def _fetch_with_limit(market: PolymarketNBAMarket) -> tuple[str, Optional[MarketPrices]]:
+            async with semaphore:
+                prices = await self.get_market_prices(market)
+                return market.condition_id, prices
+
+        pairs = await asyncio.gather(
+            *[_fetch_with_limit(m) for m in markets]
+        )
+
+        return {cid: prices for cid, prices in pairs if prices is not None}
 
 
 class TimeSeriesPriceFetcher:
