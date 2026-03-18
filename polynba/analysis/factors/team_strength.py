@@ -434,8 +434,18 @@ class TeamStrengthFactor:
         if not home_ctx or not away_ctx:
             return 0.0, None
 
-        home_players = list(home_ctx.player_stats_map.values())
-        away_players = list(away_ctx.player_stats_map.values())
+        # Filter out injured players — only count tonight's available roster
+        home_injured = {inj.player_name for inj in home_ctx.injuries}
+        away_injured = {inj.player_name for inj in away_ctx.injuries}
+
+        home_players = [
+            ps for name, ps in home_ctx.player_stats_map.items()
+            if name not in home_injured
+        ]
+        away_players = [
+            ps for name, ps in away_ctx.player_stats_map.items()
+            if name not in away_injured
+        ]
 
         if not home_players or not away_players:
             return 0.0, None

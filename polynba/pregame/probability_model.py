@@ -24,8 +24,10 @@ class PreGameModelConfig:
     """Configuration for the pre-game probability model."""
 
     # Logistic steepness: controls how quickly strength score maps to probability.
-    # At k=0.018 a score of +50 → ~67% win probability.
-    logistic_k: float = 0.018
+    # At k=0.030 a score of +25 → ~68%, +50 → ~82%, calibrated to NBA benchmarks:
+    #   10-pt NR gap (elite vs rebuilding) ≈ 75-80% win rate
+    #   5-pt NR gap (contender vs average) ≈ 65% win rate
+    logistic_k: float = 0.030
 
     # Blend weights: model and market must sum to 1.0.
     model_weight: float = 0.30
@@ -198,9 +200,9 @@ class PreGameProbabilityModel:
         logger.debug("H2H adjustment: %+.4f", adj)
 
         # ----------------------------------------------------------------
-        # Step 4 — Model probability (clamped to [0.05, 0.95])
+        # Step 4 — Model probability (clamped to [0.03, 0.97])
         # ----------------------------------------------------------------
-        model_prob = max(0.05, min(0.95, raw_prob + adj))
+        model_prob = max(0.03, min(0.97, raw_prob + adj))
 
         # ----------------------------------------------------------------
         # Step 5 — Blend with market probability
