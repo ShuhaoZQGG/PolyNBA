@@ -59,3 +59,10 @@ batch_results_*/
 replay_results_*/
 **/data/snapshots/
 **/data/pregame_orders/
+
+# Frontend
+node_modules/
+web/frontend/dist/
+
+# Claude Code
+.claude/
