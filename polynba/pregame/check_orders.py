@@ -60,13 +60,27 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-async def _get_token_balance(client, token_id: str) -> int:
+async def _get_token_balance(client, token_id: str, debug: bool = False) -> int:
     """Get on-chain token balance (floor to whole shares)."""
     from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+    if debug:
+        # Log which address/config the client is using
+        funder = getattr(client, "funder", None)
+        signer_addr = None
+        creds = getattr(client, "creds", None)
+        if hasattr(client, "signer") and hasattr(client.signer, "address"):
+            signer_addr = client.signer.address()
+        print(f"  [DEBUG] Balance check: funder={funder}, signer={signer_addr}")
+        print(f"  [DEBUG] Token ID (first 40 chars): {token_id[:40]}...")
 
     result = client.get_balance_allowance(
         BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
     )
+
+    if debug:
+        print(f"  [DEBUG] Raw API response: {result}")
+
     raw = int(result.get("balance", "0"))
     return raw // 1_000_000  # 6 decimals → whole shares
 
@@ -111,7 +125,7 @@ async def _run(args: argparse.Namespace) -> None:
 
         if order:
             filled = int(order.filled_size)
-            status = order.status.value
+            status = order.status.value.upper()
         elif oid in open_ids:
             filled = entry.get("filled_shares", 0)
             status = "OPEN"

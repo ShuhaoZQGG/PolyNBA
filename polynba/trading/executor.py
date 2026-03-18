@@ -14,6 +14,22 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class TradeHistoryEntry:
+    """A single trade fill from the user's perspective."""
+
+    market: str  # condition_id
+    asset_id: str
+    outcome: str
+    side: str  # "BUY" or "SELL"
+    size: float
+    price: float
+    fee_rate_bps: float
+    match_time: str
+    trader_side: str  # "MAKER" or "TAKER"
+    status: str
+
+
+@dataclass
 class Order:
     """Represents a trading order."""
 
@@ -205,6 +221,20 @@ class TradingExecutor(ABC):
             Dict mapping token_id to position size
         """
         pass
+
+    async def get_trade_history(self, after_ts: Optional[int] = None) -> list[TradeHistoryEntry]:
+        """Get trade history from the CLOB API.
+
+        Returns list of user fills. Base implementation returns empty list.
+        """
+        return []
+
+    async def get_market_info(self, condition_id: str) -> Optional[dict]:
+        """Fetch market metadata (question, resolution status, winner).
+
+        Returns raw market dict or None. Base implementation returns None.
+        """
+        return None
 
 
 class PaperTradingExecutor(TradingExecutor):
@@ -457,6 +487,27 @@ class PaperTradingExecutor(TradingExecutor):
     async def get_positions(self) -> dict[str, Decimal]:
         """Get paper positions."""
         return dict(self._positions)
+
+    async def get_trade_history(self, after_ts: Optional[int] = None) -> list[TradeHistoryEntry]:
+        """Return fills from internal paper orders."""
+        entries = []
+        for order in self._orders.values():
+            if order.status != OrderStatus.FILLED:
+                continue
+            entries.append(TradeHistoryEntry(
+                market=order.market_id,
+                asset_id=order.token_id,
+                outcome="",
+                side=order.side.value if hasattr(order.side, "value") else str(order.side),
+                size=float(order.filled_size),
+                price=float(order.avg_fill_price),
+                fee_rate_bps=0,
+                match_time=order.updated_at.isoformat(),
+                trader_side="TAKER",
+                status="MATCHED",
+            ))
+        entries.sort(key=lambda e: e.match_time, reverse=True)
+        return entries
 
 
 class LiveTradingExecutor(TradingExecutor):
@@ -717,3 +768,68 @@ class LiveTradingExecutor(TradingExecutor):
         """Get positions from CLOB."""
         # Would need integration with wallet/subgraph
         return {}
+
+    async def get_trade_history(self, after_ts: Optional[int] = None) -> list[TradeHistoryEntry]:
+        """Fetch trade history from CLOB API, extracting user fills."""
+        try:
+            client = await self._get_client()
+            from py_clob_client.clob_types import TradeParams
+
+            params = TradeParams(after=after_ts) if after_ts else None
+            raw_trades = client.get_trades(params)
+
+            if not raw_trades:
+                return []
+
+            # Determine user address from funder or derive from key
+            user_address = (self._funder or "").lower()
+            entries = []
+
+            for t in raw_trades:
+                match_time = t.get("match_time", "")
+                market = t.get("market", "")
+
+                if t.get("trader_side") == "MAKER":
+                    for mo in t.get("maker_orders", []):
+                        if not user_address or mo.get("maker_address", "").lower() == user_address:
+                            entries.append(TradeHistoryEntry(
+                                market=market,
+                                asset_id=mo.get("asset_id", t.get("asset_id", "")),
+                                outcome=mo.get("outcome", t.get("outcome", "")),
+                                side=mo.get("side", ""),
+                                size=float(mo.get("matched_amount", 0)),
+                                price=float(mo.get("price", 0)),
+                                fee_rate_bps=float(mo.get("fee_rate_bps", 0)),
+                                match_time=match_time,
+                                trader_side="MAKER",
+                                status=t.get("status", ""),
+                            ))
+                else:
+                    entries.append(TradeHistoryEntry(
+                        market=market,
+                        asset_id=t.get("asset_id", ""),
+                        outcome=t.get("outcome", ""),
+                        side=t.get("side", ""),
+                        size=float(t.get("size", 0)),
+                        price=float(t.get("price", 0)),
+                        fee_rate_bps=float(t.get("fee_rate_bps", 0)),
+                        match_time=match_time,
+                        trader_side="TAKER",
+                        status=t.get("status", ""),
+                    ))
+
+            entries.sort(key=lambda e: e.match_time, reverse=True)
+            return entries
+
+        except Exception as e:
+            logger.error(f"Failed to fetch trade history: {e}")
+            return []
+
+    async def get_market_info(self, condition_id: str) -> Optional[dict]:
+        """Fetch market metadata from CLOB API."""
+        try:
+            client = await self._get_client()
+            return client.get_market(condition_id)
+        except Exception as e:
+            logger.error(f"Failed to fetch market info for {condition_id}: {e}")
+            return None
