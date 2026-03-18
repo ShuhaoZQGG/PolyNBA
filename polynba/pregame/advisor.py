@@ -27,6 +27,7 @@ from ..data.models import GameStatus, GameSummary, HeadToHead, TeamContext
 from ..polymarket.market_discovery import MarketDiscovery
 from ..polymarket.models import MarketPrices, PolymarketNBAMarket
 from ..polymarket.price_fetcher import PriceFetcher
+from .ai_analyzer import PregameAIAnalysis, PregameAIAnalyzer
 from .pregame_context import CONVICTION_PROMPT, EDGE_PROMPT, build_pregame_context
 from .probability_model import PreGameEstimate, PreGameModelConfig, PreGameProbabilityModel, TradingPlan
 
@@ -67,6 +68,10 @@ class GameAdvisory:
     estimate: PreGameEstimate
     trading_plan: Optional[TradingPlan] = None
     ai_analysis: Optional[str] = None
+    ai_detail: Optional[PregameAIAnalysis] = None
+    home_context: Optional[TeamContext] = None
+    away_context: Optional[TeamContext] = None
+    head_to_head: Optional[HeadToHead] = None
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +96,8 @@ class PreGameAdvisor:
         show_hold: bool = True,
         log_level: str = "WARNING",
         scan_date: Optional[str] = None,
+        ai_analysis: bool = True,
+        ai_model: str = "claude-haiku-4-5-20251001",
     ) -> None:
         """Initialise the advisor.
 
@@ -102,6 +109,8 @@ class PreGameAdvisor:
             show_hold: If False, HOLD recommendations are omitted from output.
             log_level: Python logging level string (DEBUG / INFO / WARNING / ERROR).
             scan_date: Date to scan in YYYYMMDD format (defaults to today).
+            ai_analysis: Whether to run comprehensive AI analysis on BET/SPECULATE games.
+            ai_model: Model to use for comprehensive AI analysis.
         """
         self._model_config = model_config or PreGameModelConfig()
         self._bankroll = bankroll
@@ -119,6 +128,9 @@ class PreGameAdvisor:
             self._claude = ClaudeAnalyzer(
                 config=ClaudeAnalysisConfig(min_interval_seconds=5.0),
             )
+        self._ai_analyzer: Optional[PregameAIAnalyzer] = None
+        if self._use_claude and ai_analysis:
+            self._ai_analyzer = PregameAIAnalyzer(model=ai_model)
 
     # ------------------------------------------------------------------
     # Public API
@@ -308,7 +320,13 @@ class PreGameAdvisor:
         )
 
         # ----------------------------------------------------------------
-        # 6. Optionally filter out HOLD recommendations
+        # 6. Comprehensive AI analysis (BET + SPECULATE games)
+        # ----------------------------------------------------------------
+        if self._ai_analyzer:
+            await self._ai_analyzer.analyze_games(advisories)
+
+        # ----------------------------------------------------------------
+        # 7. Optionally filter out HOLD recommendations
         # ----------------------------------------------------------------
         if not self._show_hold:
             before = len(advisories)
@@ -322,7 +340,7 @@ class PreGameAdvisor:
             )
 
         # ----------------------------------------------------------------
-        # 7. Print formatted output
+        # 8. Print formatted output
         # ----------------------------------------------------------------
         self._format_output(advisories)
 
@@ -447,6 +465,9 @@ class PreGameAdvisor:
             estimate=estimate,
             trading_plan=trading_plan,
             ai_analysis=ai_analysis,
+            home_context=home_ctx,
+            away_context=away_ctx,
+            head_to_head=h2h,
         )
         advisories = [primary]
 
@@ -942,8 +963,29 @@ class PreGameAdvisor:
                     print(f"    {factor_line}")
             print()
 
-            # Claude AI analysis block (for SPECULATE verdicts)
-            if adv.ai_analysis:
+            # Comprehensive AI analysis (BET + SPECULATE)
+            if adv.ai_detail:
+                ai = adv.ai_detail
+                print(f"  AI: {ai.headline}")
+                print(f"    {ai.narrative}")
+                print(f"    Verdict rationale: {ai.verdict_rationale}")
+                if ai.key_factors_for:
+                    print("    For:")
+                    for f in ai.key_factors_for:
+                        print(f"      + {f}")
+                if ai.key_factors_against:
+                    print("    Against:")
+                    for f in ai.key_factors_against:
+                        print(f"      - {f}")
+                print(
+                    f"    Confidence: {ai.confidence_rating}/10 | "
+                    f"Market: {ai.market_efficiency} | "
+                    f"Upset risk: {ai.upset_risk}"
+                )
+                print(f"    Game script: {ai.game_script}")
+                print()
+            # Claude conviction analysis (for SPECULATE verdicts)
+            elif adv.ai_analysis:
                 print("  AI Analysis:")
                 for ai_line in adv.ai_analysis.split("\n"):
                     print(f"    {ai_line}")

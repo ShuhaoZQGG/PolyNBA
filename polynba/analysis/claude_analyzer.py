@@ -195,6 +195,114 @@ Provide your analysis in the structured format."""
         self._usage.requests_today += 1
         self._usage.cost_today_usd += cost
 
+    async def analyze_with_schema(
+        self,
+        prompt: str,
+        response_model: type[BaseModel],
+        tool_name: str,
+        game_id: str,
+        cache_key: Optional[str] = None,
+        model_override: Optional[str] = None,
+        max_tokens_override: Optional[int] = None,
+        force: bool = False,
+    ) -> Optional[BaseModel]:
+        """Analyze using any Pydantic model for structured output.
+
+        Args:
+            prompt: Complete prompt string.
+            response_model: Pydantic model class for structured output.
+            tool_name: Name of the tool for structured output.
+            game_id: Game identifier for caching.
+            cache_key: Optional namespaced cache key (defaults to game_id).
+            model_override: Optional model override (e.g. Sonnet).
+            max_tokens_override: Optional max_tokens override.
+            force: Force analysis even if rate limited.
+
+        Returns:
+            Instance of response_model or None if skipped/failed.
+        """
+        effective_key = cache_key or game_id
+        context_hash = str(hash(prompt))
+
+        # Check cache
+        cached = self._get_cached(effective_key, context_hash)
+        if cached is not None:
+            return cached
+
+        # Check rate limit
+        if not force and not self._check_rate_limit():
+            logger.debug("Rate limited, skipping analysis for %s", effective_key)
+            return None
+
+        # Check budget
+        if not self._check_budget():
+            logger.warning("Daily budget exceeded, skipping analysis")
+            return None
+
+        try:
+            client = await self._get_client()
+
+            response = await client.messages.create(
+                model=model_override or self._config.model,
+                max_tokens=max_tokens_override or self._config.max_tokens,
+                temperature=self._config.temperature,
+                messages=[{"role": "user", "content": prompt}],
+                tools=[
+                    {
+                        "name": tool_name,
+                        "description": f"Submit the {tool_name} analysis",
+                        "input_schema": response_model.model_json_schema(),
+                    }
+                ],
+                tool_choice={"type": "tool", "name": tool_name},
+            )
+
+            self._last_analysis_time = datetime.now()
+
+            # Update usage with appropriate cost rates
+            if model_override and "sonnet" in model_override:
+                old_input_cost = self._config.cost_per_1k_input_tokens
+                old_output_cost = self._config.cost_per_1k_output_tokens
+                self._config.cost_per_1k_input_tokens = 0.003
+                self._config.cost_per_1k_output_tokens = 0.015
+                self._update_usage(
+                    response.usage.input_tokens,
+                    response.usage.output_tokens,
+                )
+                self._config.cost_per_1k_input_tokens = old_input_cost
+                self._config.cost_per_1k_output_tokens = old_output_cost
+            else:
+                self._update_usage(
+                    response.usage.input_tokens,
+                    response.usage.output_tokens,
+                )
+
+            tool_use = next(
+                (block for block in response.content if block.type == "tool_use"),
+                None,
+            )
+
+            if tool_use is None:
+                logger.error("No tool use in Claude response for %s", effective_key)
+                return None
+
+            result = response_model(**tool_use.input)
+
+            # Cache with namespaced key
+            self._cache[effective_key] = AnalysisCache(
+                game_id=effective_key,
+                analysis=result,  # type: ignore[arg-type]
+                timestamp=datetime.now(),
+                context_hash=context_hash,
+            )
+
+            logger.info("Analysis complete for %s via %s", effective_key, tool_name)
+            return result
+
+        except Exception as e:
+            logger.error("Analysis failed for %s: %s", effective_key, e)
+            return None
+
     async def analyze(
         self,
         game_context: str,

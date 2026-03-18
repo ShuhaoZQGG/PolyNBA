@@ -27,6 +27,8 @@ def main():
     parser.add_argument("--entry-aggression", type=float, default=0.50, help="Entry price aggression (0=bid, 0.5=mid, 1=ask)")
     parser.add_argument("--exit-capture", type=float, default=0.80, help="Edge capture fraction for TRADE exits")
     parser.add_argument("--max-spread", type=float, default=0.08, help="Max bid-ask spread to accept without warning")
+    parser.add_argument("--ai-analysis", action=argparse.BooleanOptionalAction, default=True, help="Enable/disable comprehensive AI analysis (default: on when Claude is enabled)")
+    parser.add_argument("--ai-model", type=str, default="claude-haiku-4-5-20251001", help="Model for comprehensive AI analysis")
     parser.add_argument("--log-level", default="WARNING", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging level")
 
     args = parser.parse_args()
@@ -57,6 +59,8 @@ def main():
         show_hold=not args.no_hold,
         log_level=args.log_level,
         scan_date=args.date,
+        ai_analysis=args.ai_analysis,
+        ai_model=args.ai_model,
     )
 
     try:

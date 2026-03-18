@@ -85,6 +85,42 @@ much to scale the bet size UP or DOWN from the base Kelly calculation:
 Provide your analysis in the structured format."""
 
 
+def build_comprehensive_context(
+    game: GameSummary,
+    home_ctx: TeamContext,
+    away_ctx: TeamContext,
+    h2h: Optional[HeadToHead],
+    estimate: PreGameEstimate,
+    market_home_price: float,
+    bankroll: Optional[float] = None,
+) -> str:
+    """Build a single comprehensive context string for AI analysis.
+
+    Combines game_context, market_context, and quant_analysis from
+    build_pregame_context() into one structured string with section headers.
+    """
+    game_ctx, market_ctx, quant_str = build_pregame_context(
+        game=game,
+        home_ctx=home_ctx,
+        away_ctx=away_ctx,
+        h2h=h2h,
+        estimate=estimate,
+        market_home_price=market_home_price,
+        bankroll=bankroll,
+    )
+    sections = [
+        "=== GAME CONTEXT ===",
+        game_ctx,
+        "",
+        "=== MARKET INFORMATION ===",
+        market_ctx,
+        "",
+        "=== QUANTITATIVE ANALYSIS ===",
+        quant_str,
+    ]
+    return "\n".join(sections)
+
+
 def build_pregame_context(
     game: GameSummary,
     home_ctx: TeamContext,
