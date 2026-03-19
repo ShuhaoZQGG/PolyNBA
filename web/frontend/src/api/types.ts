@@ -340,3 +340,37 @@ export interface RecordPregameOrderRequest {
 export interface PregameDatesResponse {
   dates: string[]
 }
+
+// ---------------------------------------------------------------------------
+// Team Data types
+// ---------------------------------------------------------------------------
+
+export interface TeamInjuries {
+  team_id: string
+  team_abbreviation: string
+  injuries: PlayerInjury[]
+  key_players_out: number
+}
+
+export interface PlayerStatsEntry {
+  player_name: string
+  team_abbreviation: string
+  games_played: number
+  minutes_per_game: number
+  points_per_game: number
+  rebounds_per_game: number
+  assists_per_game: number
+  steals_per_game: number
+  blocks_per_game: number
+  field_goal_pct: number
+  three_point_pct: number
+  free_throw_pct: number
+  true_shooting_pct: number | null
+  usage_rate: number | null
+  net_rating: number | null
+}
+
+export interface RefreshResponse {
+  refreshed: string[]
+  message: string
+}

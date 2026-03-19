@@ -3,6 +3,7 @@ import AppShell from './components/layout/AppShell'
 import Dashboard from './pages/Dashboard'
 import GameDetail from './pages/GameDetail'
 import Activity from './pages/Activity'
+import TeamData from './pages/TeamData'
 
 export default function App() {
   return (
@@ -12,6 +13,7 @@ export default function App() {
           <Route index element={<Navigate to="/markets" replace />} />
           <Route path="/markets" element={<Dashboard />} />
           <Route path="/game/:id" element={<GameDetail />} />
+          <Route path="/team-data" element={<TeamData />} />
           <Route path="/activity" element={<Activity />} />
         </Route>
       </Routes>

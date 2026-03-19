@@ -33,6 +33,18 @@ export default function TopBar() {
           Markets
         </NavLink>
         <NavLink
+          to="/team-data"
+          className={({ isActive }) =>
+            `px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+              isActive
+                ? 'bg-gray-100 text-gray-900'
+                : 'text-gray-500 hover:text-gray-900 hover:bg-gray-50'
+            }`
+          }
+        >
+          Team Data
+        </NavLink>
+        <NavLink
           to="/activity"
           className={({ isActive }) =>
             `px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${

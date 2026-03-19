@@ -15,6 +15,10 @@ import type {
   PregameOrdersResponse,
   PregameOrder,
   RecordPregameOrderRequest,
+  TeamInjuries,
+  TeamStats,
+  PlayerStatsEntry,
+  RefreshResponse,
 } from './types'
 
 // ---------------------------------------------------------------------------
@@ -31,6 +35,9 @@ export const queryKeys = {
   tradeHistory: ['tradeHistory'] as const,
   pregameDates: ['pregameDates'] as const,
   pregameOrders: (date: string) => ['pregameOrders', date] as const,
+  teamInjuries: ['teamInjuries'] as const,
+  teamStrength: ['teamStrength'] as const,
+  playerStats: ['playerStats'] as const,
 }
 
 // ---------------------------------------------------------------------------
@@ -251,5 +258,48 @@ export function usePlaceSell() {
       toast.success('Sell order placed')
     },
     onError: (error) => toast.error(`Failed to place sell: ${error.message}`),
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Team Data
+// ---------------------------------------------------------------------------
+
+export function useTeamInjuries() {
+  return useQuery({
+    queryKey: queryKeys.teamInjuries,
+    queryFn: () => fetchApi<TeamInjuries[]>('/data/injuries'),
+    staleTime: 5 * 60_000,
+  })
+}
+
+export function useTeamStrength() {
+  return useQuery({
+    queryKey: queryKeys.teamStrength,
+    queryFn: () => fetchApi<TeamStats[]>('/data/team-strength'),
+    staleTime: 5 * 60_000,
+  })
+}
+
+export function usePlayerStats() {
+  return useQuery({
+    queryKey: queryKeys.playerStats,
+    queryFn: () => fetchApi<PlayerStatsEntry[]>('/data/player-stats'),
+    staleTime: 5 * 60_000,
+  })
+}
+
+export function useRefreshData() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (targets: string[]) =>
+      postJson<RefreshResponse>('/data/refresh', { targets }),
+    onSuccess: (data) => {
+      void qc.invalidateQueries({ queryKey: queryKeys.teamInjuries })
+      void qc.invalidateQueries({ queryKey: queryKeys.teamStrength })
+      void qc.invalidateQueries({ queryKey: queryKeys.playerStats })
+      toast.success(data.message)
+    },
+    onError: (error) => toast.error(`Refresh failed: ${error.message}`),
   })
 }

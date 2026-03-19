@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import CORS_ORIGINS, IS_LIVE_MODE
 from .dependencies import init_services, shutdown_services
-from .routers import analysis, games, markets, portfolio, positions, pregame_orders, trading
+from .routers import analysis, data, games, markets, portfolio, positions, pregame_orders, trading
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,7 @@ app.include_router(analysis.router)
 app.include_router(trading.router)
 app.include_router(games.router)
 app.include_router(pregame_orders.router)
+app.include_router(data.router)
 
 
 # ---------------------------------------------------------------------------

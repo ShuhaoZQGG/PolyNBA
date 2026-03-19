@@ -676,3 +676,51 @@ class RecordPregameOrderRequest(BaseModel):
 
 class PregameDatesResponse(BaseModel):
     dates: list[str]
+
+
+# ---------------------------------------------------------------------------
+# Data router schemas (injuries, team strength, player stats, refresh)
+# ---------------------------------------------------------------------------
+
+
+class TeamInjuriesSchema(BaseModel):
+    """Injury summary for a single team."""
+
+    team_id: str
+    team_abbreviation: str
+    injuries: list[PlayerInjurySchema]
+    key_players_out: int
+
+
+class PlayerStatsEntry(BaseModel):
+    """Per-player season average stats returned by the player-stats endpoint."""
+
+    player_name: str
+    team_abbreviation: str
+    games_played: int
+    minutes_per_game: float
+    points_per_game: float
+    rebounds_per_game: float
+    assists_per_game: float
+    steals_per_game: float
+    blocks_per_game: float
+    field_goal_pct: float
+    three_point_pct: float
+    free_throw_pct: float
+    # Advanced stats — None when not yet fetched from NBA.com
+    true_shooting_pct: Optional[float] = None
+    usage_rate: Optional[float] = None
+    net_rating: Optional[float] = None
+
+
+class RefreshRequest(BaseModel):
+    """Request body for the /api/data/refresh endpoint."""
+
+    targets: list[Literal["injuries", "team_stats", "player_stats", "all"]]
+
+
+class RefreshResponse(BaseModel):
+    """Response returned after a successful cache refresh."""
+
+    refreshed: list[str]
+    message: str
