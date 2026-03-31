@@ -674,6 +674,12 @@ class RecordPregameOrderRequest(BaseModel):
     date: Optional[str] = None  # YYYYMMDD, defaults to today
 
 
+class UpdateExitPriceRequest(BaseModel):
+    """Request body for updating an order's exit price."""
+
+    exit_price: Optional[float] = None
+
+
 class PregameDatesResponse(BaseModel):
     dates: list[str]
 

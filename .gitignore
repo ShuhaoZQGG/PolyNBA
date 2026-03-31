@@ -66,3 +66,5 @@ web/frontend/dist/
 
 # Claude Code
 .claude/
+
+.nx

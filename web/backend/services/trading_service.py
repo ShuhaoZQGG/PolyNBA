@@ -20,8 +20,8 @@ logger = logging.getLogger(__name__)
 _MIN_ORDER_USDC = Decimal("0.01")
 # Tick size: prices are rounded to this precision
 _PRICE_TICK = Decimal("0.01")
-# Share size precision (2 decimal places)
-_SIZE_TICK = Decimal("0.01")
+# Share size precision (integer shares — Polymarket cannot sell fractional at limit)
+_SIZE_TICK = Decimal("1")
 
 
 async def place_order(

@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect } from 'react'
+import { useState, useMemo, useEffect, Fragment } from 'react'
 import { useTeamInjuries, useTeamStrength, usePlayerStats, useRefreshData } from '../api/hooks'
 import type { TeamInjuries, TeamStats, PlayerStatsEntry, PlayerInjury } from '../api/types'
 import { getTeamColor } from '../constants/teams'
@@ -238,13 +238,80 @@ function TeamInjuryCard({ team }: { team: TeamInjuries }) {
   )
 }
 
+function TeamFilterBar({
+  allTeams,
+  selected,
+  onToggle,
+  onClear,
+}: {
+  allTeams: string[]
+  selected: Set<string>
+  onToggle: (abbr: string) => void
+  onClear: () => void
+}) {
+  return (
+    <div className="px-5 py-3 border-b border-[#E5E5E5] flex flex-wrap items-center gap-2">
+      <span className="text-xs font-medium text-gray-500 uppercase tracking-wider mr-1">Filter:</span>
+      {allTeams.map((abbr) => {
+        const isActive = selected.has(abbr)
+        const color = getTeamColor(abbr)
+        return (
+          <button
+            key={abbr}
+            onClick={() => onToggle(abbr)}
+            className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-bold transition-all ${
+              isActive ? 'text-white ring-2 ring-offset-1' : 'opacity-40 hover:opacity-70'
+            }`}
+            style={{
+              backgroundColor: isActive ? color : undefined,
+              color: isActive ? 'white' : color,
+              border: isActive ? `2px solid ${color}` : `1px solid ${color}`,
+            }}
+          >
+            {abbr}
+          </button>
+        )
+      })}
+      {selected.size > 0 && (
+        <button
+          onClick={onClear}
+          className="ml-2 text-xs text-gray-400 hover:text-gray-600 underline transition-colors"
+        >
+          Clear all
+        </button>
+      )}
+    </div>
+  )
+}
+
 function InjuriesTab({ data, isLoading }: { data: TeamInjuries[] | undefined; isLoading: boolean }) {
+  const [selectedTeams, setSelectedTeams] = useState<Set<string>>(new Set())
+
   const teamsWithInjuries = useMemo(() => {
     if (!data) return []
     return data
       .filter((t) => t.injuries.length > 0)
       .sort((a, b) => b.key_players_out - a.key_players_out || b.injuries.length - a.injuries.length)
   }, [data])
+
+  const allTeamAbbrs = useMemo(
+    () => teamsWithInjuries.map((t) => t.team_abbreviation).sort(),
+    [teamsWithInjuries],
+  )
+
+  const filtered = useMemo(() => {
+    if (selectedTeams.size === 0) return teamsWithInjuries
+    return teamsWithInjuries.filter((t) => selectedTeams.has(t.team_abbreviation))
+  }, [teamsWithInjuries, selectedTeams])
+
+  function handleToggle(abbr: string) {
+    setSelectedTeams((prev) => {
+      const next = new Set(prev)
+      if (next.has(abbr)) next.delete(abbr)
+      else next.add(abbr)
+      return next
+    })
+  }
 
   if (isLoading) {
     return (
@@ -270,10 +337,22 @@ function InjuriesTab({ data, isLoading }: { data: TeamInjuries[] | undefined; is
   }
 
   return (
-    <div className="p-5 space-y-4">
-      {teamsWithInjuries.map((team) => (
-        <TeamInjuryCard key={team.team_id} team={team} />
-      ))}
+    <div>
+      <TeamFilterBar
+        allTeams={allTeamAbbrs}
+        selected={selectedTeams}
+        onToggle={handleToggle}
+        onClear={() => setSelectedTeams(new Set())}
+      />
+      <div className="p-5 space-y-4">
+        {filtered.length === 0 ? (
+          <div className="p-8 text-center">
+            <p className="text-sm text-gray-400">No injuries for the selected teams</p>
+          </div>
+        ) : (
+          filtered.map((team) => <TeamInjuryCard key={team.team_id} team={team} />)
+        )}
+      </div>
     </div>
   )
 }
@@ -281,6 +360,8 @@ function InjuriesTab({ data, isLoading }: { data: TeamInjuries[] | undefined; is
 // ---------------------------------------------------------------------------
 // Team Strength tab
 // ---------------------------------------------------------------------------
+
+type StrengthSubTab = 'stats' | 'effective'
 
 function StreakCell({ streak }: { streak: number }) {
   if (streak === 0) return <span className="text-gray-400">-</span>
@@ -301,7 +382,316 @@ function NetRatingCell({ value }: { value: number }) {
   )
 }
 
-function TeamStrengthTab({ data, isLoading }: { data: TeamStats[] | undefined; isLoading: boolean }) {
+// ---------------------------------------------------------------------------
+// Effective Roster computation
+// ---------------------------------------------------------------------------
+
+interface InjuredPlayerImpact {
+  playerName: string
+  status: string
+  ppg: number
+  rpg: number
+  apg: number
+  mpg: number
+  gamesPlayed: number
+  totalTeamGames: number
+  participationRate: number
+  isNewImpact: boolean
+}
+
+interface EffectiveTeam {
+  team: TeamStats
+  injuredOut: InjuredPlayerImpact[]
+  newImpactPpg: number
+  alreadyReflectedPpg: number
+  adjustedNetRating: number
+  impactLevel: 'none' | 'minor' | 'moderate' | 'significant' | 'critical'
+}
+
+function computeEffectiveStrength(
+  teams: TeamStats[],
+  injuries: TeamInjuries[],
+  playerStats: PlayerStatsEntry[],
+): EffectiveTeam[] {
+  const injuryByTeam = new Map<string, TeamInjuries>()
+  for (const ti of injuries) {
+    injuryByTeam.set(ti.team_abbreviation, ti)
+  }
+
+  // Build player lookup: normalize names to lowercase for fuzzy matching
+  const playerByKey = new Map<string, PlayerStatsEntry>()
+  for (const p of playerStats) {
+    playerByKey.set(`${p.team_abbreviation}:${p.player_name.toLowerCase()}`, p)
+  }
+
+  return teams.map((team) => {
+    const totalGames = team.wins + team.losses
+    const teamInjuries = injuryByTeam.get(team.team_abbreviation)
+    const outPlayers = teamInjuries?.injuries.filter((i) => i.is_out) ?? []
+
+    const injuredOut: InjuredPlayerImpact[] = outPlayers.map((inj) => {
+      const key = `${team.team_abbreviation}:${inj.player_name.toLowerCase()}`
+      const stats = playerByKey.get(key)
+      const gamesPlayed = stats?.games_played ?? 0
+      const participationRate = totalGames > 0 ? gamesPlayed / totalGames : 0
+
+      return {
+        playerName: inj.player_name,
+        status: inj.status,
+        ppg: inj.points_per_game ?? stats?.points_per_game ?? 0,
+        rpg: inj.rebounds_per_game ?? stats?.rebounds_per_game ?? 0,
+        apg: inj.assists_per_game ?? stats?.assists_per_game ?? 0,
+        mpg: inj.minutes_per_game ?? stats?.minutes_per_game ?? 0,
+        gamesPlayed,
+        totalTeamGames: totalGames,
+        participationRate,
+        // Player played >50% of the season → team stats include their contributions
+        // so their current absence is a "new" hit not yet reflected in the record
+        isNewImpact: participationRate > 0.5,
+      }
+    })
+
+    injuredOut.sort((a, b) => b.ppg - a.ppg)
+
+    const newImpactPpg = injuredOut
+      .filter((p) => p.isNewImpact)
+      .reduce((sum, p) => sum + p.ppg, 0)
+
+    const alreadyReflectedPpg = injuredOut
+      .filter((p) => !p.isNewImpact)
+      .reduce((sum, p) => sum + p.ppg, 0)
+
+    // Rough net rating adjustment: ~0.5 NRtg points per PPG of new impact lost
+    const adjustedNetRating = team.net_rating - newImpactPpg * 0.5
+
+    let impactLevel: EffectiveTeam['impactLevel'] = 'none'
+    if (newImpactPpg >= 25) impactLevel = 'critical'
+    else if (newImpactPpg >= 15) impactLevel = 'significant'
+    else if (newImpactPpg >= 8) impactLevel = 'moderate'
+    else if (newImpactPpg > 0) impactLevel = 'minor'
+
+    return { team, injuredOut, newImpactPpg, alreadyReflectedPpg, adjustedNetRating, impactLevel }
+  })
+}
+
+const IMPACT_BADGE: Record<EffectiveTeam['impactLevel'], { label: string; cls: string }> = {
+  none: { label: 'Full Strength', cls: 'bg-green-100 text-green-700' },
+  minor: { label: 'Minor', cls: 'bg-blue-100 text-blue-700' },
+  moderate: { label: 'Moderate', cls: 'bg-amber-100 text-amber-700' },
+  significant: { label: 'Significant', cls: 'bg-orange-100 text-orange-700' },
+  critical: { label: 'Critical', cls: 'bg-red-100 text-red-700' },
+}
+
+function ParticipationBadge({ rate }: { rate: number }) {
+  if (rate > 0.5) {
+    return (
+      <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-red-50 text-red-600">
+        New absence
+      </span>
+    )
+  }
+  return (
+    <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-gray-100 text-gray-500">
+      Season-long
+    </span>
+  )
+}
+
+function EffectiveRosterView({
+  teams,
+  injuries,
+  playerStats,
+  isLoading,
+}: {
+  teams: TeamStats[] | undefined
+  injuries: TeamInjuries[] | undefined
+  playerStats: PlayerStatsEntry[] | undefined
+  isLoading: boolean
+}) {
+  const [expandedTeam, setExpandedTeam] = useState<string | null>(null)
+
+  const effective = useMemo(() => {
+    if (!teams || !injuries || !playerStats) return []
+    return computeEffectiveStrength(teams, injuries, playerStats).sort(
+      (a, b) => b.adjustedNetRating - a.adjustedNetRating,
+    )
+  }, [teams, injuries, playerStats])
+
+  if (isLoading) {
+    return (
+      <div className="overflow-x-auto">
+        <table className="w-full">
+          <thead className="sticky top-0 bg-white">
+            <tr className="text-left border-b border-[#E5E5E5]">
+              {Array.from({ length: 9 }).map((_, i) => (
+                <th key={i} className="px-4 py-3">
+                  <div className="h-3 w-16 bg-gray-100 rounded animate-pulse" />
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-[#F0F0F0]">
+            <SkeletonRows rows={10} cols={9} />
+          </tbody>
+        </table>
+      </div>
+    )
+  }
+
+  if (effective.length === 0) {
+    return (
+      <div className="p-12 text-center">
+        <p className="text-sm text-gray-400">No data available — needs team stats, injuries, and player stats</p>
+      </div>
+    )
+  }
+
+  return (
+    <div>
+      <div className="px-5 py-3 bg-amber-50 border-b border-amber-100 text-xs text-amber-700">
+        <strong>How to read:</strong> &ldquo;New absence&rdquo; = player played &gt;50% of season games, so team stats
+        include their contributions and overstate current effective strength. &ldquo;Season-long&rdquo; = player missed
+        most of the season, team stats already reflect playing without them.
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full">
+          <thead className="sticky top-0 bg-white">
+            <tr className="text-left border-b border-[#E5E5E5]">
+              <th className="px-4 py-3 text-xs font-medium text-gray-500 uppercase tracking-wider">#</th>
+              <th className="px-4 py-3 text-xs font-medium text-gray-500 uppercase tracking-wider">Team</th>
+              <th className="px-4 py-3 text-xs font-medium text-gray-500 uppercase tracking-wider">Record</th>
+              <th className="px-4 py-3 text-xs font-medium text-gray-500 uppercase tracking-wider text-right">
+                Net Rtg
+              </th>
+              <th className="px-4 py-3 text-xs font-medium text-gray-500 uppercase tracking-wider text-right">
+                Adj. Net Rtg
+              </th>
+              <th className="px-4 py-3 text-xs font-medium text-gray-500 uppercase tracking-wider text-right">
+                OUT
+              </th>
+              <th className="px-4 py-3 text-xs font-medium text-gray-500 uppercase tracking-wider text-right">
+                New Impact PPG
+              </th>
+              <th className="px-4 py-3 text-xs font-medium text-gray-500 uppercase tracking-wider text-right">
+                Already Adj. PPG
+              </th>
+              <th className="px-4 py-3 text-xs font-medium text-gray-500 uppercase tracking-wider">Impact</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-[#F0F0F0]">
+            {effective.map((et, idx) => {
+              const isExpanded = expandedTeam === et.team.team_id
+              const badge = IMPACT_BADGE[et.impactLevel]
+              return (
+                <Fragment key={et.team.team_id}>
+                  <tr
+                    className={`hover:bg-gray-50/50 transition-colors cursor-pointer ${idx % 2 === 1 ? 'bg-gray-50/30' : ''}`}
+                    onClick={() => setExpandedTeam(isExpanded ? null : et.team.team_id)}
+                  >
+                    <td className="px-4 py-3 text-sm text-gray-400 tabular-nums">{idx + 1}</td>
+                    <td className="px-4 py-3 whitespace-nowrap">
+                      <div className="flex items-center gap-2">
+                        <TeamBadge abbr={et.team.team_abbreviation} />
+                        <span className="text-sm font-medium text-gray-900 hidden sm:inline">
+                          {et.team.team_name}
+                        </span>
+                      </div>
+                    </td>
+                    <td className="px-4 py-3 text-sm tabular-nums text-gray-900 whitespace-nowrap">
+                      {et.team.wins}-{et.team.losses}
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      <NetRatingCell value={et.team.net_rating} />
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      <NetRatingCell value={et.adjustedNetRating} />
+                    </td>
+                    <td className="px-4 py-3 text-sm tabular-nums text-gray-700 text-right">
+                      {et.injuredOut.length || '-'}
+                    </td>
+                    <td className="px-4 py-3 text-sm tabular-nums text-right">
+                      {et.newImpactPpg > 0 ? (
+                        <span className="text-red-600 font-medium">-{et.newImpactPpg.toFixed(1)}</span>
+                      ) : (
+                        <span className="text-gray-400">-</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-sm tabular-nums text-right">
+                      {et.alreadyReflectedPpg > 0 ? (
+                        <span className="text-gray-500">{et.alreadyReflectedPpg.toFixed(1)}</span>
+                      ) : (
+                        <span className="text-gray-400">-</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3">
+                      <span
+                        className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold ${badge.cls}`}
+                      >
+                        {badge.label}
+                      </span>
+                    </td>
+                  </tr>
+                  {isExpanded && et.injuredOut.length > 0 && (
+                    <tr>
+                      <td colSpan={9} className="bg-gray-50 px-4 py-3">
+                        <div className="ml-8">
+                          <table className="w-full text-sm">
+                            <thead>
+                              <tr className="text-left text-xs text-gray-500 uppercase">
+                                <th className="pb-2 pr-4">Player</th>
+                                <th className="pb-2 pr-4">Status</th>
+                                <th className="pb-2 pr-4 text-right">PPG</th>
+                                <th className="pb-2 pr-4 text-right">RPG</th>
+                                <th className="pb-2 pr-4 text-right">APG</th>
+                                <th className="pb-2 pr-4 text-right">MPG</th>
+                                <th className="pb-2 pr-4 text-right">GP</th>
+                                <th className="pb-2 pr-4 text-right">Played %</th>
+                                <th className="pb-2">Classification</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-gray-200">
+                              {et.injuredOut.map((p) => (
+                                <tr key={p.playerName} className="text-gray-700">
+                                  <td className="py-1.5 pr-4 font-medium">{p.playerName}</td>
+                                  <td className="py-1.5 pr-4">
+                                    <StatusBadge status={p.status} />
+                                  </td>
+                                  <td className="py-1.5 pr-4 text-right tabular-nums">{fmtStat(p.ppg)}</td>
+                                  <td className="py-1.5 pr-4 text-right tabular-nums">{fmtStat(p.rpg)}</td>
+                                  <td className="py-1.5 pr-4 text-right tabular-nums">{fmtStat(p.apg)}</td>
+                                  <td className="py-1.5 pr-4 text-right tabular-nums">{fmtStat(p.mpg)}</td>
+                                  <td className="py-1.5 pr-4 text-right tabular-nums">
+                                    {p.gamesPlayed}/{p.totalTeamGames}
+                                  </td>
+                                  <td className="py-1.5 pr-4 text-right tabular-nums">
+                                    {(p.participationRate * 100).toFixed(0)}%
+                                  </td>
+                                  <td className="py-1.5">
+                                    <ParticipationBadge rate={p.participationRate} />
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Team Strength tab with sub-tabs
+// ---------------------------------------------------------------------------
+
+function SeasonStatsView({ data, isLoading }: { data: TeamStats[] | undefined; isLoading: boolean }) {
   const sorted = useMemo(() => {
     if (!data) return []
     return [...data].sort((a, b) => b.win_percentage - a.win_percentage)
@@ -385,6 +775,62 @@ function TeamStrengthTab({ data, isLoading }: { data: TeamStats[] | undefined; i
           )}
         </tbody>
       </table>
+    </div>
+  )
+}
+
+function TeamStrengthTab({
+  data,
+  injuriesData,
+  playerData,
+  isLoading,
+  injuriesLoading,
+  playerLoading,
+}: {
+  data: TeamStats[] | undefined
+  injuriesData: TeamInjuries[] | undefined
+  playerData: PlayerStatsEntry[] | undefined
+  isLoading: boolean
+  injuriesLoading: boolean
+  playerLoading: boolean
+}) {
+  const [subTab, setSubTab] = useState<StrengthSubTab>('stats')
+
+  return (
+    <div>
+      {/* Sub-tab bar */}
+      <div className="border-b border-[#E5E5E5] px-4 flex gap-1 bg-gray-50/50">
+        <button
+          onClick={() => setSubTab('stats')}
+          className={`px-3 py-2 text-xs font-medium rounded-t transition-colors ${
+            subTab === 'stats'
+              ? 'bg-white text-blue-600 border border-[#E5E5E5] border-b-white -mb-px'
+              : 'text-gray-500 hover:text-gray-700'
+          }`}
+        >
+          Season Stats
+        </button>
+        <button
+          onClick={() => setSubTab('effective')}
+          className={`px-3 py-2 text-xs font-medium rounded-t transition-colors ${
+            subTab === 'effective'
+              ? 'bg-white text-blue-600 border border-[#E5E5E5] border-b-white -mb-px'
+              : 'text-gray-500 hover:text-gray-700'
+          }`}
+        >
+          Effective Roster
+        </button>
+      </div>
+
+      {subTab === 'stats' && <SeasonStatsView data={data} isLoading={isLoading} />}
+      {subTab === 'effective' && (
+        <EffectiveRosterView
+          teams={data}
+          injuries={injuriesData}
+          playerStats={playerData}
+          isLoading={isLoading || injuriesLoading || playerLoading}
+        />
+      )}
     </div>
   )
 }
@@ -752,7 +1198,14 @@ export default function TeamData() {
           <InjuriesTab data={injuriesData} isLoading={injuriesLoading} />
         )}
         {activeTab === 'strength' && (
-          <TeamStrengthTab data={strengthData} isLoading={strengthLoading} />
+          <TeamStrengthTab
+            data={strengthData}
+            injuriesData={injuriesData}
+            playerData={playerData}
+            isLoading={strengthLoading}
+            injuriesLoading={injuriesLoading}
+            playerLoading={playerLoading}
+          />
         )}
         {activeTab === 'players' && (
           <PlayerStatsTab data={playerData} isLoading={playerLoading} />

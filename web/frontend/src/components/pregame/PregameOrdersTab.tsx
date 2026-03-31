@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { usePregameDates, usePregameOrders, useCheckFills, usePlaceSell } from '../../api/hooks'
+import { usePregameDates, usePregameOrders, useCheckFills, usePlaceSell, useUpdateExitPrice } from '../../api/hooks'
 import type { PregameOrder } from '../../api/types'
 
 // ---------------------------------------------------------------------------
@@ -35,6 +35,10 @@ export default function PregameOrdersTab() {
   const { data, isLoading, error } = usePregameOrders(activeDate)
   const checkFills = useCheckFills()
   const placeSell = usePlaceSell()
+  const updateExitPrice = useUpdateExitPrice()
+
+  const [editingOrderId, setEditingOrderId] = useState<string | null>(null)
+  const [editValue, setEditValue] = useState<string>('')
 
   if (datesLoading) {
     return (
@@ -144,8 +148,54 @@ export default function PregameOrdersTab() {
                       {order.shares} @ {(order.entry_price * 100).toFixed(0)}&cent;
                     </td>
                     <td className="px-5 py-3.5 text-right whitespace-nowrap tabular-nums">
-                      {order.exit_price ? `${(order.exit_price * 100).toFixed(0)}\u00a2` : (
-                        <span className="text-gray-400">HOLD</span>
+                      {editingOrderId === order.order_id ? (
+                        <input
+                          type="number"
+                          autoFocus
+                          className="w-16 rounded border border-gray-300 px-1.5 py-0.5 text-right text-sm tabular-nums focus:outline-none focus:ring-2 focus:ring-gray-400"
+                          value={editValue}
+                          onChange={(e) => setEditValue(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              const cents = parseInt(editValue, 10)
+                              updateExitPrice.mutate({
+                                orderId: order.order_id,
+                                date: activeDate,
+                                exitPrice: isNaN(cents) || editValue.trim() === '' ? null : cents / 100,
+                              })
+                              setEditingOrderId(null)
+                            } else if (e.key === 'Escape') {
+                              setEditingOrderId(null)
+                            }
+                          }}
+                          onBlur={() => {
+                            const cents = parseInt(editValue, 10)
+                            updateExitPrice.mutate({
+                              orderId: order.order_id,
+                              date: activeDate,
+                              exitPrice: isNaN(cents) || editValue.trim() === '' ? null : cents / 100,
+                            })
+                            setEditingOrderId(null)
+                          }}
+                        />
+                      ) : (
+                        <span
+                          className={`group cursor-pointer ${order.status === 'SELL_PLACED' ? 'cursor-default' : ''}`}
+                          onClick={() => {
+                            if (order.status === 'SELL_PLACED') return
+                            setEditingOrderId(order.order_id)
+                            setEditValue(order.exit_price ? (order.exit_price * 100).toFixed(0) : '')
+                          }}
+                        >
+                          {order.exit_price ? `${(order.exit_price * 100).toFixed(0)}\u00a2` : (
+                            <span className="text-gray-400">HOLD</span>
+                          )}
+                          {order.status !== 'SELL_PLACED' && (
+                            <svg className="inline-block ml-1 w-3 h-3 text-gray-300 opacity-0 group-hover:opacity-100 transition-opacity" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                              <path strokeLinecap="round" strokeLinejoin="round" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                            </svg>
+                          )}
+                        </span>
                       )}
                     </td>
                     <td className="px-5 py-3.5 text-right whitespace-nowrap tabular-nums">

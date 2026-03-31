@@ -136,7 +136,7 @@ export default function GameCard({ summary, pricesLoading }: GameCardProps) {
         <div className="text-xs text-gray-400 -mt-2">
           Suggested:{' '}
           <span className="font-medium text-gray-600">
-            ${cached_estimate.suggested_bet_usdc.toFixed(0)} on {cached_estimate.bet_side === 'HOME' ? homeAbbr : awayAbbr}
+            ${cached_estimate.suggested_bet_usdc.toFixed(0)} on {cached_estimate.bet_side.toUpperCase() === 'HOME' ? homeAbbr : awayAbbr}
           </span>
         </div>
       )}

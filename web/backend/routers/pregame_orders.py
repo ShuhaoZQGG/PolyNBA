@@ -3,6 +3,7 @@
 GET    /api/pregame-orders/dates              -> PregameDatesResponse
 GET    /api/pregame-orders?date=YYYYMMDD      -> PregameOrdersResponse
 POST   /api/pregame-orders/check-fills        -> PregameOrdersResponse
+PATCH  /api/pregame-orders/{order_id}/exit-price -> PregameOrderSchema
 POST   /api/pregame-orders/{order_id}/place-sell -> PregameOrderSchema
 """
 
@@ -21,6 +22,7 @@ from ..schemas import (
     PregameOrdersResponse,
     PregameOrdersSummary,
     RecordPregameOrderRequest,
+    UpdateExitPriceRequest,
 )
 from ..services.pregame_orders_service import (
     check_fills,
@@ -28,6 +30,7 @@ from ..services.pregame_orders_service import (
     list_dates,
     place_sell,
     record_order,
+    update_exit_price,
 )
 
 logger = logging.getLogger(__name__)
@@ -81,6 +84,16 @@ async def check_pregame_fills(
 ) -> PregameOrdersResponse:
     ledger = await check_fills(date, executor)
     return _build_response(ledger)
+
+
+@router.patch("/{order_id}/exit-price", response_model=PregameOrderSchema, summary="Update exit price")
+async def update_order_exit_price(
+    order_id: str,
+    req: UpdateExitPriceRequest,
+    date: str = Query(description="Ledger date YYYYMMDD"),
+) -> PregameOrderSchema:
+    entry = update_exit_price(date, order_id, req.exit_price)
+    return PregameOrderSchema.from_ledger_entry(entry)
 
 
 @router.post("/{order_id}/place-sell", response_model=PregameOrderSchema, summary="Place exit sell order")

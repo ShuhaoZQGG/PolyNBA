@@ -1,6 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import toast from 'react-hot-toast'
-import { fetchApi, postJson, deleteApi, ApiError } from './client'
+import { fetchApi, postJson, patchJson, deleteApi, ApiError } from './client'
 import type {
   PortfolioResponse,
   PositionsResponse,
@@ -244,6 +244,22 @@ export function useRecordPregameOrder() {
       void qc.invalidateQueries({ queryKey: queryKeys.pregameDates })
       void qc.invalidateQueries({ queryKey: ['pregameOrders'] })
     },
+  })
+}
+
+export function useUpdateExitPrice() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ orderId, date, exitPrice }: { orderId: string; date: string; exitPrice: number | null }) =>
+      patchJson<PregameOrder>(
+        `/pregame-orders/${encodeURIComponent(orderId)}/exit-price?date=${date}`,
+        { exit_price: exitPrice },
+      ),
+    onSuccess: (_data, variables) => {
+      void qc.invalidateQueries({ queryKey: queryKeys.pregameOrders(variables.date) })
+      toast.success('Exit price updated')
+    },
+    onError: (error) => toast.error(`Failed to update exit price: ${error.message}`),
   })
 }
 

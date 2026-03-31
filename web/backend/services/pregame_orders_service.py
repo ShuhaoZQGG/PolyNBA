@@ -128,6 +128,23 @@ async def check_fills(date_str: str, executor) -> dict:
     return ledger
 
 
+def update_exit_price(date_str: str, order_id: str, exit_price: float | None) -> dict:
+    """Update the exit_price for an order. Rejects if sell already placed."""
+    ledger = get_orders(date_str)
+    orders = ledger.get("orders", [])
+
+    entry = next((e for e in orders if e["order_id"] == order_id), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
+
+    if entry.get("status") == "SELL_PLACED":
+        raise HTTPException(status_code=400, detail="Cannot edit exit price after sell is placed")
+
+    entry["exit_price"] = exit_price
+    _save_ledger(date_str, ledger)
+    return entry
+
+
 async def place_sell(date_str: str, order_id: str, executor) -> dict:
     """Place an exit sell order for a filled TRADE entry. Returns updated entry."""
     from polynba.data.models.enums import TradeSide

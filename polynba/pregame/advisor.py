@@ -53,6 +53,23 @@ def _normalise_espn_abbr(abbr: str) -> str:
 logger = logging.getLogger(__name__)
 
 
+def _snap_bet_to_integer_shares(
+    estimate: "PreGameEstimate",
+    trading_plan: Optional["TradingPlan"],
+) -> "PreGameEstimate":
+    """Adjust suggested_bet_usdc so it buys an exact integer number of shares.
+
+    Polymarket cannot sell fractional shares at a limit price, so we floor
+    shares to an integer and recompute the USDC amount.
+    """
+    if trading_plan is None or trading_plan.entry_price <= 0:
+        return estimate
+    integer_shares = math.floor(estimate.suggested_bet_usdc / trading_plan.entry_price)
+    if integer_shares <= 0:
+        return estimate
+    return replace(estimate, suggested_bet_usdc=integer_shares * trading_plan.entry_price)
+
+
 # ---------------------------------------------------------------------------
 # Data container
 # ---------------------------------------------------------------------------
@@ -457,6 +474,7 @@ class PreGameAdvisor:
 
         # ---- Trading plan ----
         trading_plan = self._compute_trading_plan(estimate, prices, market)
+        estimate = _snap_bet_to_integer_shares(estimate, trading_plan)
 
         primary = GameAdvisory(
             game=game,
@@ -687,6 +705,7 @@ class PreGameAdvisor:
 
         # Compute trading plan — will naturally get RESOLUTION since bet_side_prob >= threshold
         trading_plan = self._compute_trading_plan(conviction_estimate, prices, market)
+        conviction_estimate = _snap_bet_to_integer_shares(conviction_estimate, trading_plan)
 
         return GameAdvisory(
             game=game,

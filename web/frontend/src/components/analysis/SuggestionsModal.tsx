@@ -67,9 +67,14 @@ export default function SuggestionsModal({ advisories, onClose, onOrderPlaced, o
     return () => window.removeEventListener('keydown', handler)
   }, [onClose])
 
+  function advisoryKey(advisory: GameAdvisoryResponse): string {
+    return `${advisory.game.game_id}:${advisory.estimate.bet_side}`
+  }
+
   function handlePlaceOrder(advisory: GameAdvisoryResponse) {
-    const gameId = advisory.game.game_id
-    const tokenId = advisory.estimate.bet_side === 'HOME'
+    const key = advisoryKey(advisory)
+    const betSide = advisory.estimate.bet_side.toUpperCase()
+    const tokenId = betSide === 'HOME'
       ? advisory.market.home_token_id
       : advisory.market.away_token_id
 
@@ -82,10 +87,10 @@ export default function SuggestionsModal({ advisories, onClose, onOrderPlaced, o
       strategy_id: 'pregame-advisor',
     }
 
-    setPendingId(gameId)
+    setPendingId(key)
     placeOrder.mutate(order, {
       onSuccess: (data) => {
-        setPlacedIds((prev) => new Set(prev).add(gameId))
+        setPlacedIds((prev) => new Set(prev).add(key))
         setPendingId(null)
         onOrderPlaced?.()
 
@@ -95,7 +100,7 @@ export default function SuggestionsModal({ advisories, onClose, onOrderPlaced, o
           recordOrder.mutate({
             order_id: data.order.order_id,
             game: `${advisory.game.away_team_abbreviation} @ ${advisory.game.home_team_abbreviation}`,
-            team: advisory.estimate.bet_side === 'HOME'
+            team: betSide === 'HOME'
               ? advisory.game.home_team_abbreviation
               : advisory.game.away_team_abbreviation,
             token_id: tokenId,
@@ -148,23 +153,23 @@ export default function SuggestionsModal({ advisories, onClose, onOrderPlaced, o
           ) : (
             <div className="space-y-3">
               {suggestions.map((advisory) => {
-                const gameId = advisory.game.game_id
-                const isPlaced = placedIds.has(gameId)
-                const isPending = pendingId === gameId
-                const isExpanded = expandedId === gameId
+                const key = advisoryKey(advisory)
+                const isPlaced = placedIds.has(key)
+                const isPending = pendingId === key
+                const isExpanded = expandedId === key
                 const tp = advisory.trading_plan!
                 const est = advisory.estimate
                 const ai = advisory.ai_detail
 
                 return (
                   <div
-                    key={gameId}
+                    key={key}
                     className={`rounded-xl border transition-colors ${isExpanded ? 'border-blue-200 bg-blue-50/30' : 'border-gray-100 bg-gray-50/50 hover:bg-gray-50'}`}
                   >
                     {/* Summary row */}
                     <div
                       className="flex items-center gap-4 p-4 cursor-pointer select-none"
-                      onClick={() => setExpandedId(isExpanded ? null : gameId)}
+                      onClick={() => setExpandedId(isExpanded ? null : key)}
                     >
                       {/* Chevron */}
                       <svg
@@ -180,11 +185,14 @@ export default function SuggestionsModal({ advisories, onClose, onOrderPlaced, o
                           {advisory.game.away_team_abbreviation} @ {advisory.game.home_team_abbreviation}
                         </p>
                         <div className="flex items-center gap-2 mt-1 flex-wrap">
+                          <span className={`text-xs font-medium rounded px-1.5 py-0.5 ${tp.exit_price != null ? 'bg-indigo-100 text-indigo-700' : 'bg-emerald-100 text-emerald-700'}`}>
+                            {tp.exit_price != null ? 'TRADE' : 'RESOLUTION'}
+                          </span>
                           <span className={`text-xs font-medium rounded px-1.5 py-0.5 ${verdictColor(est.verdict)}`}>
-                            {verdictLabel(est.verdict)}
+                            {est.bet_side.toUpperCase() === 'HOME' ? 'BET HOME' : 'BET AWAY'}
                           </span>
                           <span className="text-xs text-gray-500">
-                            {est.bet_side === 'HOME' ? advisory.game.home_team_abbreviation : advisory.game.away_team_abbreviation}
+                            {est.bet_side.toUpperCase() === 'HOME' ? advisory.game.home_team_abbreviation : advisory.game.away_team_abbreviation}
                           </span>
                         </div>
                       </div>

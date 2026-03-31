@@ -37,6 +37,13 @@ export function postJson<T>(path: string, body: unknown): Promise<T> {
   })
 }
 
+export function patchJson<T>(path: string, body: unknown): Promise<T> {
+  return fetchApi<T>(path, {
+    method: 'PATCH',
+    body: JSON.stringify(body),
+  })
+}
+
 export function deleteApi<T>(path: string): Promise<T> {
   return fetchApi<T>(path, { method: 'DELETE' })
 }

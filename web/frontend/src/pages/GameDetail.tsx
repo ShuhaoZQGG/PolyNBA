@@ -41,7 +41,7 @@ function TradingPlanCard({ plan, advisory }: {
         </div>
         <div>
           <p className="text-xs text-gray-400">Bet Side</p>
-          <p className="font-medium text-gray-800 text-xs mt-0.5">{estimate.bet_side === 'HOME' ? advisory.game.home_team_abbreviation : advisory.game.away_team_abbreviation}</p>
+          <p className="font-medium text-gray-800 text-xs mt-0.5">{estimate.bet_side.toUpperCase() === 'HOME' ? advisory.game.home_team_abbreviation : advisory.game.away_team_abbreviation}</p>
         </div>
         <div>
           <p className="text-xs text-gray-400">Entry Price</p>
